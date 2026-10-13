@@ -25,6 +25,9 @@ type Account struct {
 
 type Lease struct {
 	Account Account
+	Context context.Context
+	shared  *store.Lease
+	cancel  context.CancelFunc
 	pool    *Pool
 	once    sync.Once
 }
@@ -75,6 +78,7 @@ func (p *Pool) ReserveMatching(ctx context.Context, pools []string, excluded map
 // ReserveMatchingLimit waits when every matching account is at its concurrency
 // limit. A non-positive limit preserves the legacy least-busy behavior.
 func (p *Pool) ReserveMatchingLimit(ctx context.Context, pools []string, excluded map[string]bool, match func(Account) bool, maxInflight int) (*Lease, error) {
+	busy := map[string]bool{}
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -94,13 +98,18 @@ func (p *Pool) ReserveMatchingLimit(ctx context.Context, pools []string, exclude
 		minInflight := int(^uint(0) >> 1)
 		var selected Account
 		found := false
+		selectedIndex := 0
 		start := 0
 		if len(p.accounts) > 0 {
 			start = int(p.next % uint64(len(p.accounts)))
 		}
 		for offset := 0; offset < len(p.accounts); offset++ {
 			account := p.accounts[(start+offset)%len(p.accounts)]
-			if excluded[account.Token] || (match != nil && !match(account)) || !p.available(account, pools, now) {
+			if excluded[account.Token] || !p.available(account, pools, now) || (match != nil && !match(account)) {
+				continue
+			}
+			if busy[account.Token] {
+				capacityBlocked = true
 				continue
 			}
 			inflight := p.inflight[account.Token]
@@ -112,6 +121,10 @@ func (p *Pool) ReserveMatchingLimit(ctx context.Context, pools []string, exclude
 				minInflight = inflight
 				selected = account
 				found = true
+				selectedIndex = (start + offset) % len(p.accounts)
+				if inflight == 0 {
+					break // Zero is the minimum; do not scan the remaining account pool.
+				}
 			}
 		}
 		if !found {
@@ -124,16 +137,68 @@ func (p *Pool) ReserveMatchingLimit(ctx context.Context, pools []string, exclude
 			case <-ctx.Done():
 				return nil, ctx.Err()
 			case <-wake:
+				busy = map[string]bool{}
+				continue
+			case <-time.After(250 * time.Millisecond):
+				busy = map[string]bool{}
 				continue
 			}
 		}
 
 		// Starting at a rotating offset preserves tie fairness without building
 		// a temporary candidate list for every request.
-		p.next++
+		p.next = uint64(selectedIndex + 1)
 		p.inflight[selected.Token]++
 		p.mu.Unlock()
-		return &Lease{Account: selected, pool: p}, nil
+		leaseCtx, cancel := context.WithCancel(ctx)
+		lease := &Lease{Account: selected, pool: p, Context: leaseCtx, cancel: cancel}
+		if maxInflight > 0 {
+			for slot := 0; slot < maxInflight; slot++ {
+				shared, e := p.repository.AcquireLease(ctx, store.SlotResource(selected.Fields, slot), 120*time.Second)
+				if e != nil {
+					p.Release(lease)
+					return nil, e
+				}
+				if shared != nil {
+					lease.shared = shared
+					break
+				}
+			}
+			if lease.shared == nil {
+				busy[selected.Token] = true
+				p.Release(lease)
+				continue
+			}
+			gate, e := p.repository.AcquireLease(ctx, "account-use:"+store.AccountResource(selected.Fields), 15*time.Second)
+			if e != nil {
+				p.Release(lease)
+				return nil, e
+			}
+			if gate == nil {
+				busy[selected.Token] = true
+				p.Release(lease)
+				continue
+			}
+			// Feedback/rotation may have committed after this replica's cached snapshot.
+			current, e := p.repository.FindAccount(firstString(selected.Fields, "id", "access_token", "accessToken"))
+			gate.Release()
+			if e != nil {
+				p.Release(lease)
+				return nil, e
+			}
+			fresh, ok := normalize(current)
+			p.mu.Lock()
+			available := p.available(fresh, pools, time.Now())
+			p.mu.Unlock()
+			if !ok || !available || fresh.Token != selected.Token || (match != nil && !match(fresh)) {
+				busy[selected.Token] = true
+				p.Release(lease)
+				continue
+			}
+			lease.Account = fresh
+			lease.shared.KeepAlive(leaseCtx, 120*time.Second, cancel)
+		}
+		return lease, nil
 	}
 }
 
@@ -142,6 +207,12 @@ func (p *Pool) Release(lease *Lease) {
 		return
 	}
 	lease.once.Do(func() {
+		if lease.shared != nil {
+			lease.shared.Release()
+		}
+		if lease.cancel != nil {
+			lease.cancel()
+		}
 		p.mu.Lock()
 		defer p.mu.Unlock()
 		if p.inflight[lease.Account.Token] <= 1 {

@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -25,6 +26,7 @@ type runtimeMonitor struct {
 }
 
 type monitorRecord struct {
+	cancelFunc   context.CancelFunc
 	CallID       string           `json:"call_id"`
 	Endpoint     string           `json:"endpoint"`
 	Model        string           `json:"model"`
@@ -37,6 +39,9 @@ type monitorRecord struct {
 	Duration     int64            `json:"duration_ms,omitempty"`
 	Progress     int              `json:"progress,omitempty"`
 	Error        string           `json:"error,omitempty"`
+	RawError     string           `json:"raw_error,omitempty"`
+	FailureCode  string           `json:"failure_code,omitempty"`
+	Attempts     []map[string]any `json:"image_attempts,omitempty"`
 	Metrics      map[string]any   `json:"metrics,omitempty"`
 	Perf         map[string]any   `json:"perf,omitempty"`
 	Events       []map[string]any `json:"events,omitempty"`
@@ -95,6 +100,12 @@ func (m *runtimeMonitor) enrich(id string, body map[string]any) {
 	item := m.active[id]
 	if item == nil {
 		return
+	}
+	if raw := stringValue(body["raw_error"]); raw != "" {
+		item.RawError = raw
+	}
+	if code := stringValue(body["failure_code"]); code != "" {
+		item.FailureCode = code
 	}
 	if v, ok := body["metrics"].(map[string]any); ok {
 		if item.Metrics == nil {
@@ -178,7 +189,7 @@ func (m *runtimeMonitor) finish(id, status, model, summary, errText string) {
 		item.Progress = 100
 	}
 	item.Events = append(item.Events, map[string]any{"event": "completed", "label": monitorStageLabel(item.Stage), "stage": item.Stage, "status": status, "duration_ms": item.Duration, "time": time.Now().UTC()})
-	copy := *item
+	copy := cloneMonitorRecord(*item)
 	delete(m.active, id)
 	m.completed = append(m.completed, copy)
 	if len(m.completed) > m.limit {
@@ -194,11 +205,14 @@ func (m *runtimeMonitor) snapshot() map[string]any {
 	m.mu.Lock()
 	active := make([]monitorRecord, 0, len(m.active))
 	for _, item := range m.active {
-		copy := *item
+		copy := cloneMonitorRecord(*item)
 		copy.Duration = time.Now().UnixMilli() - copy.StartedAt
 		active = append(active, copy)
 	}
-	recent := append([]monitorRecord(nil), m.completed...)
+	recent := make([]monitorRecord, len(m.completed))
+	for i, item := range m.completed {
+		recent[i] = cloneMonitorRecord(item)
+	}
 	m.mu.Unlock()
 	sort.Slice(active, func(i, j int) bool { return active[i].StartedAt < active[j].StartedAt })
 	sort.Slice(recent, func(i, j int) bool { return recent[i].EndedAt > recent[j].EndedAt })
@@ -218,13 +232,13 @@ func (m *runtimeMonitor) detail(id string) (monitorRecord, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if item := m.active[id]; item != nil {
-		copy := *item
+		copy := cloneMonitorRecord(*item)
 		copy.Duration = time.Now().UnixMilli() - copy.StartedAt
 		return copy, true
 	}
 	for index := len(m.completed) - 1; index >= 0; index-- {
 		if m.completed[index].CallID == id {
-			return m.completed[index], true
+			return cloneMonitorRecord(m.completed[index]), true
 		}
 	}
 	return monitorRecord{}, false
@@ -235,9 +249,20 @@ func (m *runtimeMonitor) cancel(id string) (monitorRecord, bool) {
 	if !ok || item.Status != "running" {
 		return monitorRecord{}, false
 	}
+	if item.cancelFunc != nil {
+		item.cancelFunc()
+	}
 	m.finish(id, "cancelled", item.Model, item.Summary, "cancelled by administrator")
 	item, _ = m.detail(id)
 	return item, true
+}
+
+func cloneMonitorRecord(item monitorRecord) monitorRecord {
+	raw, _ := json.Marshal(item)
+	var copy monitorRecord
+	_ = json.Unmarshal(raw, &copy)
+	copy.cancelFunc = item.cancelFunc
+	return copy
 }
 
 func countMonitorStatus(items []monitorRecord, status string) int {
@@ -333,13 +358,21 @@ func (s *Server) monitorAPI(w http.ResponseWriter, r *http.Request) {
 	if len(parts) == 2 && parts[1] == "cancel" && r.Method == http.MethodPost {
 		item, ok := s.monitor.cancel(itemID)
 		if !ok {
+			if shared, found := s.sharedMonitorDetail(itemID); found && stringValue(shared["instance_id"]) != "" {
+				if err := s.store.RequestRuntimeCancel(itemID, stringValue(shared["instance_id"])); err != nil {
+					writeError(w, 503, "取消请求失败", "storage_error")
+					return
+				}
+				writeJSON(w, 202, map[string]any{"ok": true, "record": shared})
+				return
+			}
 			writeError(w, http.StatusNotFound, "request not found", "not_found")
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "record": item})
 		return
 	}
-	item, ok := s.monitor.detail(itemID)
+	item, ok := s.sharedMonitorDetail(itemID)
 	if !ok {
 		writeError(w, http.StatusNotFound, "request not found", "not_found")
 		return
@@ -348,7 +381,7 @@ func (s *Server) monitorAPI(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) monitorSnapshotWithHistory() map[string]any {
-	snapshot := s.monitor.snapshot()
+	snapshot := s.sharedMonitorSnapshot()
 	active := monitorRecordMaps(snapshot["active"])
 	recent := monitorRecordMaps(snapshot["recent"])
 	history, events := s.historicalMonitorRecords(200)
@@ -566,7 +599,10 @@ func monitorRecordMap(item monitorRecord) map[string]any {
 }
 
 func (s *Server) historicalMonitorRecords(limit int) ([]map[string]any, []map[string]any) {
-	items := s.loadCallLogs()
+	items, _, _ := s.store.QueryCallRecords(url.Values{"type": {"call"}}, limit, 0)
+	for i, j := 0, len(items)-1; i < j; i, j = i+1, j-1 {
+		items[i], items[j] = items[j], items[i]
+	}
 	records := []map[string]any{}
 	events := []map[string]any{}
 	for index := len(items) - 1; index >= 0 && len(records) < limit; index-- {
@@ -823,6 +859,16 @@ func (s *Server) appendCallLog(record monitorRecord, statusCode int, requestShap
 		detail["raw_error"] = errorText
 		detail["upstream_error"] = errorText
 	}
+	if record.RawError != "" {
+		detail["raw_error"] = record.RawError
+	}
+	if record.FailureCode != "" {
+		detail["error_code"] = record.FailureCode
+		detail["failure_code"] = record.FailureCode
+	}
+	if len(record.Attempts) > 0 {
+		detail["image_attempts"] = record.Attempts
+	}
 	if outputs := responseImageOutputs(responseBody); len(outputs) > 0 {
 		detail["output_images"] = outputs
 		detail["image_urls"] = outputs
@@ -834,22 +880,12 @@ func (s *Server) appendCallLog(record monitorRecord, statusCode int, requestShap
 		"summary": firstNonEmpty(strings.TrimSpace(record.Summary), record.Endpoint, record.Model, record.CallID),
 		"detail":  detail,
 	}
-	raw, err := json.Marshal(entry)
-	if err != nil {
+	if s.store == nil {
 		return
 	}
-	if err := os.MkdirAll(s.cfg.DataDir, 0o755); err != nil {
-		return
+	if err := s.store.AppendCallRecord(entry); err != nil {
+		s.runtimeLog("error", "request log persistence failed: %v", err)
 	}
-	path := filepath.Join(s.cfg.DataDir, "logs.jsonl")
-	s.logMu.Lock()
-	defer s.logMu.Unlock()
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
-	if err != nil {
-		return
-	}
-	defer file.Close()
-	_, _ = file.Write(append(raw, '\n'))
 }
 
 func responseImageOutputs(raw []byte) []map[string]string {
@@ -1024,19 +1060,41 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed", "invalid_request_error")
 		return
 	}
-	accounts, _ := s.store.AccountList()
-	accountStats := dashboardAccountStats(accounts)
+	accountItems, _, err := s.store.AccountSnapshot()
+	if err != nil {
+		writeError(w, 503, "账号数据库不可用", "storage_error")
+		return
+	}
+	accountStats := dashboardAccountStats(accountItems)
+	availability, err := s.availabilitySnapshot()
+	if err != nil {
+		writeError(w, 503, "读取账号可用性失败", "storage_error")
+		return
+	}
+	backend := "json"
+	if s.store.Shared() {
+		backend = "postgres"
+	}
 	healthy := boolValue(accountStats["healthy"], false)
+	now := time.Now()
+	_, _, step, _, first, last := dashboardWindow(r.URL.Query().Get("time_range"), now)
+	logRows, err := s.store.DashboardRecords(first, last, step)
+	if err != nil {
+		writeError(w, 503, "读取请求统计失败", "storage_error")
+		return
+	}
 	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, http.StatusOK, map[string]any{
-		"status":       map[bool]string{true: "ok", false: "degraded"}[healthy],
-		"healthy":      healthy,
-		"runtime":      "go",
-		"version":      s.cfg.Version,
-		"generated_at": time.Now().UTC().Format(time.RFC3339),
-		"accounts":     accountStats,
-		"storage":      map[string]any{"backend": "json", "health": "ok", "images": mediaStats(s.cfg.ImageDataDir), "videos": mediaStats(s.cfg.VideoDataDir)},
-		"logs":         dashboardLogSummary(s.loadCallLogs(), r.URL.Query().Get("time_range"), time.Now()),
+		"status":              map[bool]string{true: "ok", false: "degraded"}[healthy],
+		"healthy":             healthy,
+		"runtime":             "go",
+		"version":             s.cfg.Version,
+		"generated_at":        time.Now().UTC().Format(time.RFC3339),
+		"accounts":            accountStats,
+		"availability":        availability,
+		"current_concurrency": availability["active_images"],
+		"storage":             map[string]any{"backend": backend, "health": "ok", "images": mediaStats(s.cfg.ImageDataDir), "videos": mediaStats(s.cfg.VideoDataDir)},
+		"logs":                dashboardLogSummary(logRows, r.URL.Query().Get("time_range"), now),
 	})
 }
 
@@ -1094,7 +1152,7 @@ func dashboardAccountStats(items []map[string]any) map[string]any {
 	return total
 }
 
-func dashboardLogSummary(items []map[string]any, timeRange string, now time.Time) map[string]any {
+func dashboardWindow(timeRange string, now time.Time) (string, int, time.Duration, string, time.Time, time.Time) {
 	timeRange = strings.ToLower(strings.TrimSpace(timeRange))
 	if timeRange != "7d" && timeRange != "30d" {
 		timeRange = "24h"
@@ -1115,6 +1173,12 @@ func dashboardLogSummary(items []map[string]any, timeRange string, now time.Time
 		labelFormat = "01-02"
 	}
 	firstStart := currentStart.Add(-time.Duration(bucketCount-1) * bucketStep)
+	return timeRange, bucketCount, bucketStep, labelFormat, firstStart, currentStart.Add(bucketStep)
+}
+
+func dashboardLogSummary(items []map[string]any, timeRange string, now time.Time) map[string]any {
+	_, bucketCount, bucketStep, labelFormat, firstStart, last := dashboardWindow(timeRange, now)
+	location := now.Location()
 	labels := make([]string, bucketCount)
 	totalRequests := make([]int, bucketCount)
 	successRequests := make([]int, bucketCount)
@@ -1135,16 +1199,14 @@ func dashboardLogSummary(items []map[string]any, timeRange string, now time.Time
 	byErrorCode := map[string]any{}
 	recentFailures := []map[string]any{}
 	total, success, failed := 0, 0, 0
-	if len(items) > 20000 {
-		items = items[len(items)-20000:]
-	}
 	for _, item := range items {
 		if !strings.EqualFold(stringValue(item["type"]), "call") {
 			continue
 		}
 		detail := mapValue(item["detail"])
-		startedAt, ok := dashboardLogTime(firstNonEmpty(stringValue(detail["started_at"]), stringValue(item["time"])), location)
-		if !ok || startedAt.Before(firstStart) || !startedAt.Before(currentStart.Add(bucketStep)) {
+		// Count completed requests by their recorded time, consistently with SQL.
+		startedAt, ok := dashboardLogTime(firstNonEmpty(stringValue(item["time"]), stringValue(detail["started_at"])), location)
+		if !ok || startedAt.Before(firstStart) || !startedAt.Before(last) {
 			continue
 		}
 		bucket := int(startedAt.Sub(firstStart) / bucketStep)
@@ -1155,59 +1217,79 @@ func dashboardLogSummary(items []map[string]any, timeRange string, now time.Time
 		endpoint := strings.TrimSpace(firstNonEmpty(stringValue(detail["endpoint"]), stringValue(item["endpoint"])))
 		modelName := strings.TrimSpace(firstNonEmpty(stringValue(detail["model"]), stringValue(item["model"])))
 		errorText := strings.TrimSpace(firstNonEmpty(stringValue(detail["error"]), stringValue(detail["raw_error"])))
-		errorCode := strings.TrimSpace(firstNonEmpty(stringValue(detail["error_code"]), stringValue(item["error_code"])))
+		errorCode := strings.TrimSpace(firstNonEmpty(stringValue(detail["failure_code"]), stringValue(detail["error_code"]), stringValue(item["error_code"])))
 		statusCode := intValue(detail["status_code"])
-		isFailed := status == "failed" || status == "error" || status == "fail" || errorText != "" || statusCode >= 400
+		isFailed := status == "failed" || status == "error" || status == "fail" || status == "cancelled" || errorText != "" || statusCode >= 400
 		isRateLimited := statusCode == http.StatusTooManyRequests || strings.Contains(strings.ToLower(errorCode), "rate_limit") || errorCode == "429"
 		if errorCode == "" && statusCode >= 400 {
 			errorCode = fmt.Sprintf("%d", statusCode)
 		}
 
-		total++
-		totalRequests[bucket]++
+		weight := 1
+		if item["_count"] != nil {
+			weight = intValue(item["_count"])
+		}
+		if boolValue(item["_recent_only"], false) {
+			weight = 0
+		}
+		total += weight
+		totalRequests[bucket] += weight
 		if isFailed {
-			failed++
+			failed += weight
 			if isRateLimited {
-				rateLimitedRequests[bucket]++
+				rateLimitedRequests[bucket] += weight
 			} else {
-				failedRequests[bucket]++
+				failedRequests[bucket] += weight
 			}
-			recentFailures = append(recentFailures, map[string]any{
-				"id": item["id"], "time": firstNonEmpty(stringValue(item["time"]), stringValue(detail["started_at"])),
-				"summary": item["summary"], "endpoint": endpoint, "error_code": errorCode,
-				"stage": detail["stage"], "reason": firstNonEmpty(errorText, stringValue(detail["reason"])),
-				"conversation_id": detail["conversation_id"],
-			})
+			if item["_count"] == nil {
+				recentFailures = append(recentFailures, map[string]any{
+					"id": item["id"], "time": firstNonEmpty(stringValue(item["time"]), stringValue(detail["started_at"])),
+					"summary": item["summary"], "endpoint": endpoint, "error_code": errorCode,
+					"stage": detail["stage"], "reason": firstNonEmpty(errorText, stringValue(detail["reason"])),
+					"conversation_id": detail["conversation_id"],
+				})
+			}
 		} else {
-			success++
-			successRequests[bucket]++
+			success += weight
+			successRequests[bucket] += weight
 		}
 		if status != "" {
-			byStatus[status] = intValue(byStatus[status]) + 1
+			byStatus[status] = intValue(byStatus[status]) + weight
 		}
 		if strings.HasPrefix(endpoint, "/") {
-			byEndpoint[endpoint] = intValue(byEndpoint[endpoint]) + 1
+			byEndpoint[endpoint] = intValue(byEndpoint[endpoint]) + weight
 		}
 		if modelName != "" {
-			byModel[modelName] = intValue(byModel[modelName]) + 1
-			ensureDashboardIntSeries(modelRequests, modelName, bucketCount)[bucket]++
+			byModel[modelName] = intValue(byModel[modelName]) + weight
+			ensureDashboardIntSeries(modelRequests, modelName, bucketCount)[bucket] += weight
 			duration := dashboardLogMetric(detail, "duration_ms", "total_ms")
-			if duration > 0 {
+			if duration > 0 && weight > 0 {
 				ensureDashboardFloatSeries(modelTotalSums, modelName, bucketCount)[bucket] += duration
-				ensureDashboardIntSeries(modelTotalCounts, modelName, bucketCount)[bucket]++
+				c := 1
+				if item["_duration_count"] != nil {
+					c = intValue(item["_duration_count"])
+				}
+				ensureDashboardIntSeries(modelTotalCounts, modelName, bucketCount)[bucket] += c
 			}
 			ttfb := dashboardLogMetric(detail, "http_ttfb_ms", "sse_first_event_ms", "stream_first_queue_ms")
-			if ttfb > 0 {
+			if ttfb > 0 && weight > 0 {
 				ensureDashboardFloatSeries(modelTTFBSums, modelName, bucketCount)[bucket] += ttfb
-				ensureDashboardIntSeries(modelTTFBCounts, modelName, bucketCount)[bucket]++
+				c := 1
+				if item["_ttfb_count"] != nil {
+					c = intValue(item["_ttfb_count"])
+				}
+				ensureDashboardIntSeries(modelTTFBCounts, modelName, bucketCount)[bucket] += c
 			}
 		}
 		if errorCode != "" {
-			byErrorCode[errorCode] = intValue(byErrorCode[errorCode]) + 1
+			byErrorCode[errorCode] = intValue(byErrorCode[errorCode]) + weight
 		}
 	}
+	sort.SliceStable(recentFailures, func(i, j int) bool {
+		return stringValue(recentFailures[i]["time"]) > stringValue(recentFailures[j]["time"])
+	})
 	if len(recentFailures) > 10 {
-		recentFailures = recentFailures[len(recentFailures)-10:]
+		recentFailures = recentFailures[:10]
 	}
 	return map[string]any{
 		"total": total, "success": success, "failed": failed,

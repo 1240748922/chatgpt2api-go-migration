@@ -85,6 +85,9 @@ export interface Settings {
   image_check_before_hit_enabled?: boolean
   image_settle_secs?: number
   image_timeout_retry_secs?: number
+  image_upscale_enabled?: boolean
+  image_upscale_engine?: 'go' | 'sharp' | 'pillow' | 'fsrcnn'
+  genbox_push: { enabled: boolean; base_url: string; source_id: string; push_key: string; has_push_key?: boolean; timeout_secs: number; auto_push_after_studio: boolean }
   auto_remove_invalid_accounts?: boolean
   auto_remove_rate_limited_accounts?: boolean
   log_levels: string[]
@@ -94,6 +97,8 @@ export interface Settings {
     enabled: boolean
     base_url: string
     api_key: string
+    has_api_key?: boolean
+    fail_open?: boolean
     model: string
     prompt: string
   }
@@ -153,6 +158,7 @@ export interface Settings {
     webdav_url: string
     webdav_username: string
     webdav_password: string
+    has_webdav_password?: boolean
     webdav_root_path: string
     public_base_url: string
   }
@@ -161,13 +167,16 @@ export interface Settings {
     provider: string
     account_id: string
     access_key_id: string
+    has_access_key_id?: boolean
     secret_access_key: string
+    has_secret_access_key?: boolean
     bucket: string
     prefix: string
     interval_minutes: number
     rotation_keep: number
     encrypt: boolean
     passphrase: string
+    has_passphrase?: boolean
     include: Record<string, boolean>
   }
   chat_completion_cache?: {
@@ -189,6 +198,7 @@ export interface Settings {
   account_import_api?: {
     enabled: boolean
     key: string
+    has_key?: boolean
   }
   proxy_profiles?: Array<{
     id: string
@@ -291,6 +301,8 @@ export interface AdminStatsTrend {
 }
 
 export interface AdminStats {
+  availability?: AccountAvailability
+  current_concurrency?: number
   total_accounts: number
   active_accounts: number
   abnormal_accounts: number
@@ -357,6 +369,7 @@ export interface VersionCheckResponse extends VersionInfoResponse {
   is_latest: boolean
   update_available: boolean
   check_error?: string
+  check_message?: string
 }
 
 export interface DashboardProviderAccountStats {
@@ -402,6 +415,8 @@ export interface DashboardLogSummary {
 }
 
 export interface DashboardResponse {
+  availability?: AccountAvailability
+  current_concurrency?: number
   status: 'ok' | 'degraded'
   healthy: boolean
   version: string
@@ -412,4 +427,16 @@ export interface DashboardResponse {
     images: Record<string, unknown>
   }
   logs: DashboardLogSummary
+}
+
+export interface AccountAvailability {
+  states: Record<string, number>
+  labels: Record<string, string>
+  ready_quota: Record<string, { known: number; accounts: number; unknown: number }>
+  maintenance: { status?: string; running?: number; batch_size?: number; processed?: number; pending?: number; success?: number; failed?: number; reason?: string; updated_at?: string }
+  prewarm?: { ready: number; capacity: number; inflight: number; hits: number; misses: number }
+  active_images: number
+  shared_storage: boolean
+  metrics: Record<string, number>
+  sampled_at: string
 }

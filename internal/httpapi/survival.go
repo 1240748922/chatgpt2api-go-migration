@@ -145,46 +145,15 @@ func (s *Server) runOpenAISurvivalInternal() {
 }
 
 func (s *Server) survivalProbe(account map[string]any, refreshFirst bool) string {
-	token := accountToken(account)
-	if token == "" {
-		return "no_token"
-	}
-	active := account
-	refreshed := false
-	if refreshFirst && !strings.EqualFold(stringValue(account["source_type"]), "chatgpt_web") && stringValue(account["refresh_token"]) != "" {
-		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
-		result, err := s.openAIAccountClient().RefreshAccount(ctx, account)
-		cancel()
-		if err == nil {
-			updated, _, updateErr := s.store.RotateAccountTokens(token, result.AccessToken, result.RefreshToken, result.IDToken, result.Fields)
-			if updateErr == nil && updated != nil {
-				active = updated
-				refreshed = true
-			}
-		}
-	}
-	if refreshed {
-		if status := strings.ToLower(firstNonEmpty(stringValue(active["type"]), "free")); isHealthyOpenAIPlan(status) {
-			_, _, _ = s.store.UpdateAccount(accountToken(active), map[string]any{"survival_status": status, "survival_last_probe_status": status, "survival_last_checked_at": time.Now().UTC().Format(time.RFC3339), "survival_alive": true, "survival_plan_type": status, "survival_check_error": nil})
-			return status
-		}
-	}
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
-	result, err := s.openAIAccountClient().RefreshAccount(ctx, active)
+	updated, err := s.syncCredential(ctx, account, false)
 	if err != nil {
-		status := "error"
-		if strings.Contains(strings.ToLower(err.Error()), "invalid") || strings.Contains(strings.ToLower(err.Error()), "unauthorized") {
-			status = "token_dead"
-		}
-		_, _, _ = s.store.UpdateAccount(accountToken(active), map[string]any{"survival_status": status, "survival_last_probe_status": status, "survival_last_checked_at": time.Now().UTC().Format(time.RFC3339), "survival_check_error": safeRefreshError(err)})
-		return status
-	}
-	updated, _, updateErr := s.store.RotateAccountTokens(accountToken(active), result.AccessToken, result.RefreshToken, result.IDToken, map[string]any{"survival_status": firstNonEmpty(stringValue(result.Fields["type"]), "free"), "survival_last_probe_status": firstNonEmpty(stringValue(result.Fields["type"]), "free"), "survival_last_checked_at": time.Now().UTC().Format(time.RFC3339), "survival_alive": true, "survival_plan_type": firstNonEmpty(stringValue(result.Fields["type"]), "free"), "survival_check_error": nil})
-	if updateErr != nil || updated == nil {
 		return "error"
 	}
-	return firstNonEmpty(strings.ToLower(stringValue(result.Fields["type"])), "free")
+	status := firstNonEmpty(strings.ToLower(stringValue(updated["type"])), "free")
+	_, _ = s.store.UpdateAccountRuntime(accountToken(updated), map[string]any{"survival_status": status, "survival_last_checked_at": time.Now().UTC().Format(time.RFC3339), "survival_alive": true, "survival_check_error": nil})
+	return status
 }
 
 func (s *Server) finishSurvival(summary map[string]any) {

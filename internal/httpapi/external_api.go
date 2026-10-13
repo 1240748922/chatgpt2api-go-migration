@@ -195,23 +195,34 @@ func (s *Server) cpaRemoteFiles(pool externalCPAPool) ([]map[string]any, error) 
 func (s *Server) runCPAImport(pool externalCPAPool, names []string, job map[string]any) {
 	update := func(values map[string]any) { updateJob(job, values); _ = s.updateCPAJob(pool.ID, job) }
 	update(map[string]any{"status": "running"})
+	var rows []map[string]any
 	for _, name := range names {
 		payload, _, err := remoteJSON(remoteClient(true), http.MethodGet, pool.BaseURL+"/v0/management/auth-files/download", map[string]string{"Authorization": "Bearer " + pool.SecretKey, "Accept": "application/json"}, url.Values{"name": []string{name}}, nil)
 		if err != nil {
 			appendJobError(job, name, err.Error())
-		} else if token := stringValue(payload["access_token"]); token != "" {
-			added, skipped, _, addErr := s.store.AddAccounts([]string{token}, nil)
-			if addErr != nil {
-				appendJobError(job, name, addErr.Error())
-			} else {
-				job["added"] = intValue(job["added"]) + added
-				job["skipped"] = intValue(job["skipped"]) + skipped
-			}
 		} else {
-			appendJobError(job, name, "missing access_token")
+			_, imported := importedAccountValues(payload)
+			if len(imported) == 0 {
+				appendJobError(job, name, "missing access_token or refresh_token")
+			} else {
+				for _, row := range imported {
+					if stringValue(row["source_type"]) == "" {
+						row["source_type"] = "chatgpt_web"
+					}
+					rows = append(rows, row)
+				}
+			}
 		}
 		job["completed"] = intValue(job["completed"]) + 1
 		update(map[string]any{})
+	}
+	if len(rows) > 0 {
+		added, skipped, _, importID, err := s.addImportedAccounts(s.backgroundCtx, nil, rows)
+		if err != nil {
+			appendJobError(job, "import", err.Error())
+		} else {
+			job["added"], job["skipped"], job["import_job_id"] = added, skipped, importID
+		}
 	}
 	status := "completed"
 	if intValue(job["added"]) == 0 && intValue(job["skipped"]) == 0 {
@@ -490,25 +501,35 @@ func (s *Server) runSubImport(item externalSubServer, ids []string, job map[stri
 		update(map[string]any{"status": "failed"})
 		return
 	}
+	var rows []map[string]any
 	for _, id := range ids {
 		query := url.Values{"ids": []string{id}, "include_proxies": []string{"false"}}
 		payload, _, fetchErr := remoteJSON(remoteClient(item.VerifyTLS), http.MethodGet, item.BaseURL+"/api/v1/admin/accounts/data", headers, query, nil)
-		token := ""
-		if fetchErr == nil {
-			token = recursiveString(payload, "access_token", "accessToken", "token")
-		}
 		if fetchErr != nil {
 			appendJobError(job, id, fetchErr.Error())
-		} else if token == "" {
-			appendJobError(job, id, "data export missing access_token")
-		} else if added, skipped, _, addErr := s.store.AddAccounts([]string{token}, nil); addErr != nil {
-			appendJobError(job, id, addErr.Error())
 		} else {
-			job["added"] = intValue(job["added"]) + added
-			job["skipped"] = intValue(job["skipped"]) + skipped
+			_, imported := importedAccountValues(payload)
+			if len(imported) == 0 {
+				appendJobError(job, id, "data export missing credentials")
+			} else {
+				for _, row := range imported {
+					if stringValue(row["source_type"]) == "" {
+						row["source_type"] = "chatgpt_web"
+					}
+					rows = append(rows, row)
+				}
+			}
 		}
 		job["completed"] = intValue(job["completed"]) + 1
 		update(map[string]any{})
+	}
+	if len(rows) > 0 {
+		added, skipped, _, importID, err := s.addImportedAccounts(s.backgroundCtx, nil, rows)
+		if err != nil {
+			appendJobError(job, "import", err.Error())
+		} else {
+			job["added"], job["skipped"], job["import_job_id"] = added, skipped, importID
+		}
 	}
 	status := "completed"
 	if intValue(job["added"]) == 0 && intValue(job["skipped"]) == 0 {

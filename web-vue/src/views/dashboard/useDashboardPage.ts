@@ -1,5 +1,6 @@
 import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 import { statsApi } from '@/api/stats'
+import type { AccountAvailability } from '@/types/api'
 import { usePageQuery, useVisibilityPolling } from '@/composables/usePageQuery'
 import { usePageRuntime } from '@/composables/usePageRuntime'
 import {
@@ -127,6 +128,7 @@ export function useDashboardPage() {
   }
 
   const stats = ref(createDefaultStats())
+  const availability = ref<AccountAvailability>()
 
   // 每个图表独立的数据状态
   function createEmptyChartData() {
@@ -499,6 +501,7 @@ export function useDashboardPage() {
   }
 
   function applyAccountStats(overview: OverviewPayload) {
+    availability.value = overview.availability
     stats.value[0].value = formatStatNumber(overview.total_accounts)
     stats.value[1].value = formatStatNumber(overview.active_accounts)
     stats.value[2].value = formatStatNumber(overview.rate_limited_accounts)
@@ -1084,6 +1087,7 @@ export function useDashboardPage() {
   }
 
   return {
+    availability,
     stats,
     dashboardDataReady,
     dashboardLoading: computed(() => dashboardDataQuery.loading.value || !dashboardLoadSettled.value),

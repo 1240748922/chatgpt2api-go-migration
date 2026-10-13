@@ -36,6 +36,13 @@ import (
 )
 
 type Server struct {
+	instanceID         string
+	backgroundCtx      context.Context
+	backgroundCancel   context.CancelFunc
+	backgroundWG       sync.WaitGroup
+	closeOnce          sync.Once
+	importProgressMu   sync.Mutex
+	importProgressAt   time.Time
 	cfg                config.Config
 	auth               *auth.Validator
 	store              *store.Store
@@ -63,16 +70,14 @@ type Server struct {
 	logMu              sync.Mutex
 	videoMu            sync.RWMutex
 	videoJobs          map[string]*videoJob
-	imageTaskMu        sync.RWMutex
-	imageTasks         map[string]*imageTaskState
-	imageSlots         chan struct{}
-	fileTaskMu         sync.RWMutex
-	fileTasks          map[string]*editableFileTaskState
+	imageSlots         *requestLimiter
+	textSlots          *requestLimiter
+	completionCache    completionCache
+	workerMu           sync.Mutex
+	stopping           bool
 	schedulerMu        sync.Mutex
 	schedulerLeases    map[string]map[string]any
 	external           *externalManager
-	refreshMu          sync.RWMutex
-	refreshProgress    map[string]*accountRefreshProgress
 	survivalMu         sync.RWMutex
 	survivalStatus     map[string]any
 	survivalRunning    bool
@@ -83,7 +88,21 @@ type Server struct {
 }
 
 func New(cfg config.Config) *Server {
-	repository := store.New(cfg.AccountsPath, cfg.AuthKeysPath, cfg.ConfigPath)
+	repository, repositoryErr := store.Open(cfg.AccountsPath, cfg.AuthKeysPath, cfg.ConfigPath, cfg.DatabaseURL)
+	if repositoryErr != nil {
+		panic(repositoryErr)
+	}
+	if repository.Shared() {
+		values, err := repository.Config()
+		if err != nil {
+			panic("shared configuration unavailable")
+		}
+		cfg.APIKey, cfg.AdminKey = configuredAuthKeys(values, cfg.APIKey, cfg.AdminKey)
+		if cfg.WebUIKey == "" {
+			cfg.WebUIKey = stringValue(values["webui_key"])
+		}
+		config.ApplyProxyConfig(&cfg, values)
+	}
 	proxyManager := proxyruntime.NewManager(cfg.ProxyURL, cfg.ProxyPool)
 	groups := runtimeProxyGroups(cfg.ProxyGroups)
 	proxyManager.ConfigureImageGroups(cfg.FallbackProxy, groups)
@@ -100,7 +119,11 @@ func New(cfg config.Config) *Server {
 			taskQueue = redisQueue
 		}
 	}
+	backgroundCtx, backgroundCancel := context.WithCancel(context.Background())
 	server := &Server{
+		instanceID:         newImportID(),
+		backgroundCtx:      backgroundCtx,
+		backgroundCancel:   backgroundCancel,
 		cfg:                cfg,
 		auth:               auth.New(cfg.APIKey, cfg.AdminKey, cfg.AuthKeysPath, cfg.AllowAnonymous, repository),
 		store:              repository,
@@ -117,17 +140,15 @@ func New(cfg config.Config) *Server {
 		grokQuota:          provider.NewGrokQuota(cfg.GrokRateLimitsURL, requestClient, proxyManager),
 		proxyManager:       proxyManager,
 		videoJobs:          map[string]*videoJob{},
-		imageTasks:         map[string]*imageTaskState{},
 		imageSlots:         makeImageSlots(cfg.ImageMaxConcurrency),
-		fileTasks:          map[string]*editableFileTaskState{},
+		textSlots:          makeImageSlots(120),
 		schedulerLeases:    map[string]map[string]any{},
 		external:           newExternalManager(cfg.DataDir),
-		refreshProgress:    map[string]*accountRefreshProgress{},
 		survivalStatus:     map[string]any{"running": false, "last_started_at": "", "last_finished_at": "", "last_error": "", "last_summary": map[string]any{}, "next_run_at": ""},
 		survivalWake:       make(chan struct{}, 1),
 		probeStop:          make(chan struct{}),
 		probeWake:          make(chan struct{}, 1),
-		oauthStore:         oauth.NewStore(cfg.OAuthPath, firstNonEmpty(cfg.AdminKey, cfg.APIKey, "gptgrok2api")),
+		oauthStore:         oauth.NewStore(cfg.OAuthPath, firstNonEmpty(cfg.OAuthEncryptionKey, cfg.AdminKey, cfg.APIKey, "gptgrok2api")),
 		openAILogin:        oauth.NewOpenAILogin(cfg.OpenAIAuthBaseURL, cfg.OpenAIPlatformBaseURL, cfg.OpenAILoginTokenURL, requestClient),
 		agentIdentityStore: agentidentity.NewStore(cfg.DataDir, cfg.OpenAIAgentRegisterURL, requestClient),
 		taskQueue:          taskQueue,
@@ -138,7 +159,6 @@ func New(cfg config.Config) *Server {
 	server.openAIChat = provider.NewOpenAIChat(server.openAIImage)
 	proxyManager.SetImageNodeResultCallback(server.persistProxyGroupRuntimeResult)
 	server.accountPool.SetInvalidCallback(server.maybeAutoRemoveInvalidAccount)
-	server.loadEditableFileTasks()
 	server.chatProvider.SetProxyManager(proxyManager)
 	server.consoleProvider.SetProxyManager(proxyManager)
 	server.mediaProvider.SetProxyManager(proxyManager)
@@ -154,9 +174,23 @@ func New(cfg config.Config) *Server {
 	})
 	if cfg.Version != "test" {
 		server.taskQueue.Start(2)
-		go server.imageRetentionScheduler()
-		go server.grokProbeScheduler()
-		go server.openAISurvivalScheduler()
+		server.backgroundWG.Add(13)
+		go func() { defer server.backgroundWG.Done(); server.replenishmentScheduler() }()
+		go func() { defer server.backgroundWG.Done(); server.sharedRuntimeScheduler() }()
+		go func() { defer server.backgroundWG.Done(); server.imageRetentionScheduler() }()
+		go func() { defer server.backgroundWG.Done(); server.grokProbeScheduler() }()
+		go func() { defer server.backgroundWG.Done(); server.accountMaintenanceScheduler() }()
+		go func() { defer server.backgroundWG.Done(); server.importJobScheduler() }()
+		go func() { defer server.backgroundWG.Done(); server.imageTaskScheduler() }()
+		go func() { defer server.backgroundWG.Done(); server.pagePrewarmScheduler() }()
+		go func() { defer server.backgroundWG.Done(); server.editableTaskScheduler() }()
+		go func() { defer server.backgroundWG.Done(); server.accountRefreshScheduler() }()
+		go func() { defer server.backgroundWG.Done(); server.remoteMediaScheduler() }()
+		go func() { defer server.backgroundWG.Done(); server.backupScheduler() }()
+		go func() { defer server.backgroundWG.Done(); server.genboxScheduler() }()
+	}
+	if repository.Shared() {
+		_ = server.refreshProxyRuntime()
 	}
 	return server
 }
@@ -207,57 +241,22 @@ func (s *Server) refreshProxyRuntime() error {
 	return nil
 }
 
-func makeImageSlots(limit int) chan struct{} {
-	if limit <= 0 {
-		return nil
-	}
-	return make(chan struct{}, limit)
-}
-
-// acquireImageSlot bounds the number of expensive browser-image flows in the
-// process. Waiting here is real handler queue time, unlike provider stages that
-// may overlap later in the request.
-func (s *Server) acquireImageSlot(ctx context.Context, r *http.Request) (func(), error) {
-	if s == nil || s.imageSlots == nil {
-		return func() {}, nil
-	}
-	started := time.Now()
-	select {
-	case s.imageSlots <- struct{}{}:
-		waited := time.Since(started)
-		if r != nil {
-			s.stageRequestMonitor(r, "handler_queue_done", 10, map[string]any{"handler_queue_ms": waited.Milliseconds()})
-		}
-		var once sync.Once
-		return func() { once.Do(func() { <-s.imageSlots }) }, nil
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
-}
-
 // maybeAutoRemoveInvalidAccount removes browser/session accounts only after a
 // provider explicitly rejects their credential. OAuth accounts with a refresh
 // token remain available for the normal AT refresh flow, and the setting is
 // checked on every event so changes take effect without restarting the server.
 func (s *Server) maybeAutoRemoveInvalidAccount(account accounts.Account) {
-	if strings.TrimSpace(account.Token) == "" ||
-		strings.TrimSpace(stringValue(account.Fields["refresh_token"])) != "" ||
-		(strings.TrimSpace(stringValue(account.Fields["login_password"])) != "" &&
-			strings.TrimSpace(firstNonEmpty(stringValue(account.Fields["two_factor_secret"]), stringValue(account.Fields["totp_secret"]))) != "") {
+	if strings.TrimSpace(account.Token) == "" {
 		return
 	}
 	settings, err := s.store.Config()
 	if err != nil || !boolValue(settings["auto_remove_invalid_accounts"], false) {
 		return
 	}
-	removed, _, err := s.store.DeleteAccounts([]string{account.Token})
-	if err != nil {
-		log.Printf("auto remove invalid account failed: %v", err)
-		return
+	if _, err = s.removeAccountSafely(context.Background(), account.Fields, true, false); err != nil {
+		s.runtimeLog("error", "auto remove invalid account failed: %v", err)
 	}
-	if removed > 0 {
-		log.Printf("auto removed invalid account %s", accountPublicRef(account.Fields))
-	}
+
 }
 
 func (s *Server) Handler() http.Handler {
@@ -287,11 +286,22 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/updates/CHANGELOG.md", s.changelogFile)
 	mux.HandleFunc("/api/auth/users", s.userKeys)
 	mux.HandleFunc("/api/auth/users/", s.userKeyByID)
+	mux.HandleFunc("/api/account-import-jobs", s.accountImportJobs)
+	mux.HandleFunc("/api/accounts/replenishment", s.accountReplenishment)
+	mux.HandleFunc("/api/accounts/replenishment/", s.accountReplenishment)
+	mux.HandleFunc("/api/account-import-jobs/", s.accountImportJobs)
+	mux.HandleFunc("/api/accounts/availability", s.accountAvailability)
+	mux.HandleFunc("/api/accounts/maintenance-status", s.accountAvailability)
+	mux.HandleFunc("/api/accounts/selection-preview", s.accountSelectionPreview)
+	mux.HandleFunc("/api/accounts/sync", s.accountRefreshStart)
+	mux.HandleFunc("/api/accounts/refresh-access-token", s.accountAccessTokenRefresh)
 	mux.HandleFunc("/api/accounts", s.accounts)
+	mux.HandleFunc("/api/accounts/", s.accountDetailCompat)
 	mux.HandleFunc("/api/accounts/token", s.accountToken)
 	mux.HandleFunc("/api/accounts/refresh", s.accountRefreshStart)
 	mux.HandleFunc("/api/accounts/refresh-at", s.accountAccessTokenRefresh)
 	mux.HandleFunc("/api/accounts/refresh/progress/", s.accountRefreshProgressAPI)
+	mux.HandleFunc("/api/accounts/operations/", s.accountRefreshProgressAPI)
 	mux.HandleFunc("/api/accounts/oauth/start", s.accountOAuthStart)
 	mux.HandleFunc("/api/accounts/oauth/finish", s.accountOAuthFinish)
 	mux.HandleFunc("/api/accounts/export", s.accountExport)
@@ -311,6 +321,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/third-party-apps", s.thirdPartyApps)
 	mux.HandleFunc("/api/model-catalog", s.modelCatalog)
 	mux.HandleFunc("/api/logs", s.logsAPI)
+	mux.HandleFunc("/api/logs/", s.logDetail)
 	mux.HandleFunc("/api/logs/delete", s.deleteLogs)
 	mux.HandleFunc("/api/runtime-logs", s.runtimeLogs)
 	mux.HandleFunc("/api/proxy/runtime", s.proxyRuntime)
@@ -440,6 +451,11 @@ func (s *Server) withRequestMonitor(w http.ResponseWriter, r *http.Request, next
 	modelName, summary, requestShape := monitorRequestShape(r)
 	id := newChatID()
 	s.monitor.start(id, r.URL.Path, modelName, summary)
+	requestCtx, requestCancel := context.WithCancel(r.Context())
+	defer requestCancel()
+	s.monitor.mu.Lock()
+	s.monitor.active[id].cancelFunc = requestCancel
+	s.monitor.mu.Unlock()
 	proxySnapshot := s.proxyManager.Snapshot()
 	meta := map[string]any{"model": modelName, "endpoint": r.URL.Path, "has_proxy": boolValue(proxySnapshot["proxy_configured"], false), "egress_mode": stringValue(proxySnapshot["mode"])}
 	if identity, ok := s.auth.Identity(s.auth.APIKey(r)); ok {
@@ -456,13 +472,15 @@ func (s *Server) withRequestMonitor(w http.ResponseWriter, r *http.Request, next
 	s.monitor.update(id, "handler_started", 10, "")
 	s.monitor.enrich(id, map[string]any{"metrics": map[string]any{"handler_queue_ms": 0}})
 	capture := &statusCaptureWriter{ResponseWriter: w}
-	next.ServeHTTP(capture, r.WithContext(context.WithValue(r.Context(), monitorCallIDKey{}, id)))
+	next.ServeHTTP(capture, r.WithContext(context.WithValue(requestCtx, monitorCallIDKey{}, id)))
 	status := capture.status
 	if status == 0 {
 		status = http.StatusOK
 	}
 	errText := monitorResponseErrorText(capture.body.Bytes(), status)
-	if status >= 400 {
+	if existing, ok := s.monitor.detail(id); ok && existing.Status == "cancelled" {
+		status = 499
+	} else if status >= 400 {
 		s.monitor.finish(id, "failed", modelName, summary, errText)
 	} else {
 		s.monitor.finish(id, "success", modelName, summary, "")
@@ -725,16 +743,14 @@ func chatMessagesFromAny(value any) []protocol.Message {
 	return messages
 }
 
-func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{
-		"status":              "ok",
-		"runtime":             "go",
-		"version":             s.cfg.Version,
-		"upstream_configured": s.cfg.UpstreamURL != "",
-		"queue_backend":       s.cfg.QueueBackend,
-		"proxy":               s.proxyManager.Snapshot(),
-		"timestamp":           time.Now().UTC(),
-	})
+func (s *Server) health(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+	defer cancel()
+	if s.store.Ready(ctx) != nil {
+		writeJSON(w, 503, map[string]any{"status": "unavailable", "runtime": "go", "storage": "unavailable"})
+		return
+	}
+	writeJSON(w, 200, map[string]any{"status": "ok", "runtime": "go", "version": s.cfg.Version, "storage": map[bool]string{true: "postgres", false: "json"}[s.store.Shared()], "queue_backend": s.cfg.QueueBackend, "timestamp": time.Now().UTC()})
 }
 
 func (s *Server) listModels(w http.ResponseWriter, r *http.Request) {
@@ -806,13 +822,16 @@ func (s *Server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "top_p must be between 0 and 1", "invalid_request_error")
 		return
 	}
+	r = s.reviewRequest(w, r, protocol.ExtractMessage(request.Messages))
+	if r == nil {
+		return
+	}
+	if cfg, e := s.store.Config(); e == nil && stringValue(cfg["global_system_prompt"]) != "" {
+		request.Messages = append([]protocol.Message{{Role: "system", Content: stringValue(cfg["global_system_prompt"])}}, request.Messages...)
+	}
 	route, ok := model.ResolveChat(request.Model)
 	if !ok {
 		writeError(w, http.StatusNotFound, "model not found", "invalid_request_error")
-		return
-	}
-	if route.Console {
-		s.consoleChatCompletions(w, r, request)
 		return
 	}
 	if route.Image {
@@ -823,27 +842,42 @@ func (s *Server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	if route.OpenAI {
-		if request.Stream {
-			s.streamOpenAIChat(w, r, request, route)
-		} else {
-			s.completeOpenAIChat(w, r, request, route)
+	if s.serveCompletionCache(w, r, request, func(w http.ResponseWriter, r *http.Request, request protocol.ChatRequest) {
+		release, err := s.acquireCapacity(r.Context(), r, false)
+		if err != nil {
+			writeError(w, 503, "Local request capacity is busy. Please retry.", "local_busy")
+			return
 		}
-		return
-	}
-	if len(request.Tools) > 0 || request.ToolChoice != nil {
-		if request.Stream {
-			s.streamToolChat(w, r, request, route)
-		} else {
-			s.completeChat(w, r, request, route)
+		defer release()
+		if route.Console {
+			s.consoleChatCompletions(w, r, request)
+			return
 		}
+		if route.OpenAI {
+			if request.Stream {
+				s.streamOpenAIChat(w, r, request, route)
+			} else {
+				s.completeOpenAIChat(w, r, request, route)
+			}
+			return
+		}
+		if len(request.Tools) > 0 || request.ToolChoice != nil {
+			if request.Stream {
+				s.streamToolChat(w, r, request, route)
+			} else {
+				s.completeChat(w, r, request, route)
+			}
+			return
+		}
+		if request.Stream {
+			s.streamChat(w, r, request, route)
+			return
+		}
+		s.completeChat(w, r, request, route)
+	}) {
 		return
 	}
-	if request.Stream {
-		s.streamChat(w, r, request, route)
-		return
-	}
-	s.completeChat(w, r, request, route)
+
 }
 
 func (s *Server) completeChat(w http.ResponseWriter, r *http.Request, request protocol.ChatRequest, route model.ChatRoute) {
@@ -1172,7 +1206,7 @@ func (s *Server) proxyUpstream(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(resp.StatusCode)
 	if _, err := io.Copy(w, resp.Body); err != nil {
-		log.Printf("upstream response copy: %v", err)
+		s.runtimeLog("warning", "upstream response copy: %v", err)
 	}
 }
 
@@ -1238,7 +1272,8 @@ func (s *Server) userKeys(w http.ResponseWriter, r *http.Request) {
 		if !decodeJSON(w, r, &body) {
 			return
 		}
-		item, rawKey, err := s.store.CreateKey("user", body.Name, firstNonEmpty(s.cfg.AdminKey, s.cfg.APIKey))
+		apiKey, adminKey := s.auth.Keys()
+		item, rawKey, err := s.store.CreateKey("user", body.Name, firstNonEmpty(adminKey, apiKey))
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err.Error(), "invalid_request_error")
 			return
@@ -1275,7 +1310,8 @@ func (s *Server) userKeyByID(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "no updates provided", "invalid_request_error")
 			return
 		}
-		item, err := s.store.UpdateKey(id, "user", filtered, s.cfg.AdminKey)
+		apiKey, adminKey := s.auth.Keys()
+		item, err := s.store.UpdateKey(id, "user", filtered, firstNonEmpty(adminKey, apiKey))
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
 				writeError(w, http.StatusNotFound, "user key not found", "not_found")
@@ -1365,7 +1401,7 @@ func (s *Server) accountToken(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) listAccounts(w http.ResponseWriter, r *http.Request) {
-	items, err := s.store.AccountList()
+	items, _, err := s.store.AccountSnapshot()
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error(), "server_error")
 		return
@@ -1390,7 +1426,7 @@ func (s *Server) listAccounts(w http.ResponseWriter, r *http.Request) {
 		if !accountGroupMatches(item, groupID) {
 			continue
 		}
-		filtered = append(filtered, accountForAPI(item))
+		filtered = append(filtered, item)
 	}
 	start := (page - 1) * pageSize
 	if start > len(filtered) {
@@ -1401,8 +1437,8 @@ func (s *Server) listAccounts(w http.ResponseWriter, r *http.Request) {
 		end = len(filtered)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"items":     filtered[start:end],
-		"accounts":  filtered[start:end],
+		"items":     accountsForAPI(filtered[start:end], s.configuredImageMinimumValidity()),
+		"accounts":  accountsForAPI(filtered[start:end], s.configuredImageMinimumValidity()),
 		"total":     len(filtered),
 		"all_total": len(items),
 		"page":      page,
@@ -1420,20 +1456,21 @@ func (s *Server) addAccounts(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &body) {
 		return
 	}
-	added, skipped, items, err := s.store.AddAccounts(body.Tokens, body.Accounts)
+	added, skipped, items, jobID, err := s.addImportedAccounts(r.Context(), body.Tokens, body.Accounts)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error(), "server_error")
 		return
 	}
 	returnItems := body.ReturnItems == nil || *body.ReturnItems
 	response := map[string]any{
-		"added":     added,
-		"skipped":   skipped,
-		"refreshed": 0,
-		"errors":    []string{},
+		"added":         added,
+		"skipped":       skipped,
+		"refreshed":     0,
+		"import_job_id": jobID,
+		"errors":        []string{},
 	}
 	if returnItems {
-		response["items"] = accountsForAPI(items)
+		response["items"] = accountsForAPI(items, s.configuredImageMinimumValidity())
 	}
 	writeJSON(w, http.StatusOK, response)
 }
@@ -1499,12 +1536,19 @@ func (s *Server) cleanupImportedAbnormalAccounts(w http.ResponseWriter, r *http.
 
 func (s *Server) deleteAccounts(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Tokens []string `json:"tokens"`
+		Tokens    []string          `json:"tokens"`
+		IDs       []string          `json:"account_ids"`
+		Selection *accountSelection `json:"selection"`
 	}
 	if !decodeJSON(w, r, &body) {
 		return
 	}
-	if len(body.Tokens) == 0 {
+	refs, err := s.selectedOperationRefs(body.Tokens, body.IDs, body.Selection)
+	if err != nil {
+		writeError(w, 400, err.Error(), "invalid_request_error")
+		return
+	}
+	if len(refs) == 0 {
 		writeError(w, http.StatusBadRequest, "tokens is required", "invalid_request_error")
 		return
 	}
@@ -1513,7 +1557,7 @@ func (s *Server) deleteAccounts(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error(), "server_error")
 		return
 	}
-	tokens, missing := resolveAccountRefTokens(items, body.Tokens)
+	tokens, missing := resolveAccountRefTokens(items, refs)
 	removed, items, err := s.store.DeleteAccounts(tokens)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error(), "server_error")
@@ -1522,7 +1566,7 @@ func (s *Server) deleteAccounts(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"removed": removed,
 		"errors":  missing,
-		"items":   accountsForAPI(items),
+		"items":   accountsForAPI(items, s.configuredImageMinimumValidity()),
 	})
 }
 
@@ -1534,7 +1578,7 @@ func (s *Server) updateAccount(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &body) {
 		return
 	}
-	ref := strings.TrimSpace(stringValue(body["access_token"]))
+	ref := firstNonEmpty(stringValue(body["id"]), stringValue(body["account_id"]), stringValue(body["access_token"]))
 	if ref == "" {
 		writeError(w, http.StatusBadRequest, "access_token is required", "invalid_request_error")
 		return
@@ -1556,20 +1600,29 @@ func (s *Server) updateAccount(w http.ResponseWriter, r *http.Request) {
 			updates[key] = value
 		}
 	}
+	if stringValue(body["id"]) != "" || stringValue(body["account_id"]) != "" {
+		for _, key := range []string{"access_token", "refresh_token", "id_token"} {
+			if value := strings.TrimSpace(stringValue(body[key])); value != "" {
+				updates[key] = value
+			}
+		}
+	}
 	if len(updates) == 0 {
 		writeError(w, http.StatusBadRequest, "no updates provided", "invalid_request_error")
 		return
 	}
-	item, items, err := s.store.UpdateAccount(token, updates)
+	item, err := s.updateManagedAccount(r.Context(), token, updates)
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
+		if errors.Is(err, errCredentialBusy) {
+			writeError(w, http.StatusConflict, "账号正在生图或续期，请稍后修改凭据", "account_busy")
+		} else if errors.Is(err, os.ErrNotExist) {
 			writeError(w, http.StatusNotFound, "account not found", "not_found")
 		} else {
 			writeError(w, http.StatusInternalServerError, err.Error(), "server_error")
 		}
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"item": accountForAPI(item), "items": accountsForAPI(items)})
+	writeJSON(w, http.StatusOK, map[string]any{"item": accountForAPI(item, s.configuredImageMinimumValidity()), "items": accountsForAPI([]map[string]any{item}, s.configuredImageMinimumValidity())})
 }
 
 func (s *Server) batchUpdateAccounts(w http.ResponseWriter, r *http.Request) {
@@ -1577,13 +1630,16 @@ func (s *Server) batchUpdateAccounts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		AccessTokens []string `json:"access_tokens"`
-		Status       string   `json:"status"`
+		AccessTokens []string          `json:"access_tokens"`
+		IDs          []string          `json:"account_ids"`
+		Selection    *accountSelection `json:"selection"`
+		Status       string            `json:"status"`
 	}
 	if !decodeJSON(w, r, &body) {
 		return
 	}
-	if len(body.AccessTokens) == 0 || strings.TrimSpace(body.Status) == "" {
+	refs, err := s.selectedOperationRefs(body.AccessTokens, body.IDs, body.Selection)
+	if err != nil || len(refs) == 0 || strings.TrimSpace(body.Status) == "" {
 		writeError(w, http.StatusBadRequest, "access_tokens and status are required", "invalid_request_error")
 		return
 	}
@@ -1592,7 +1648,7 @@ func (s *Server) batchUpdateAccounts(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error(), "server_error")
 		return
 	}
-	tokens, missing := resolveAccountRefTokens(current, body.AccessTokens)
+	tokens, missing := resolveAccountRefTokens(current, refs)
 	updated := 0
 	errItems := make([]string, 0, len(missing))
 	for _, ref := range missing {
@@ -1615,7 +1671,7 @@ func (s *Server) batchUpdateAccounts(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"updated": updated,
 		"errors":  errItems,
-		"items":   accountsForAPI(all),
+		"items":   accountsForAPI(all, s.configuredImageMinimumValidity()),
 	})
 }
 
@@ -1624,13 +1680,20 @@ func (s *Server) bindAccountGroup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		AccessTokens []string `json:"access_tokens"`
-		GroupID      string   `json:"group_id"`
+		AccessTokens []string          `json:"access_tokens"`
+		IDs          []string          `json:"account_ids"`
+		Selection    *accountSelection `json:"selection"`
+		GroupID      string            `json:"group_id"`
 	}
 	if !decodeJSON(w, r, &body) {
 		return
 	}
 	groupID := strings.TrimSpace(body.GroupID)
+	refs, err := s.selectedOperationRefs(body.AccessTokens, body.IDs, body.Selection)
+	if err != nil || len(refs) == 0 {
+		writeError(w, 400, "no valid accounts selected", "invalid_request_error")
+		return
+	}
 	if groupID == "__ungrouped__" {
 		groupID = ""
 	}
@@ -1640,7 +1703,7 @@ func (s *Server) bindAccountGroup(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error(), "server_error")
 		return
 	}
-	tokens, missing := resolveAccountRefTokens(current, body.AccessTokens)
+	tokens, missing := resolveAccountRefTokens(current, refs)
 	errItems := make([]string, 0, len(missing))
 	for _, ref := range missing {
 		errItems = append(errItems, tokenPreview(ref)+"... not found")
@@ -1663,7 +1726,7 @@ func (s *Server) bindAccountGroup(w http.ResponseWriter, r *http.Request) {
 		"updated":  updated,
 		"errors":   errItems,
 		"group_id": groupID,
-		"items":    accountsForAPI(all),
+		"items":    accountsForAPI(all, s.configuredImageMinimumValidity()),
 	})
 }
 
@@ -1786,29 +1849,23 @@ func (s *Server) settings(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, err.Error(), "server_error")
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"runtime": "go", "config": configValue})
-	case http.MethodPost:
+		writeJSON(w, http.StatusOK, map[string]any{"runtime": "go", "config": store.RedactManagedConfig(configValue)})
+	case http.MethodPost, http.MethodPatch:
 		var updates map[string]any
 		if !decodeJSON(w, r, &updates) {
 			return
 		}
-		current, err := s.store.Config()
+		current, err := s.store.PatchManagedConfig(updates)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error(), "server_error")
 			return
 		}
-		for key, value := range updates {
-			current[key] = value
-		}
-		if err := s.store.ReplaceConfig(current); err != nil {
-			writeError(w, http.StatusInternalServerError, err.Error(), "server_error")
-			return
-		}
+		s.applyAuthConfig(current)
 		if err := s.refreshProxyRuntime(); err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error(), "server_error")
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"runtime": "go", "config": current})
+		writeJSON(w, http.StatusOK, map[string]any{"runtime": "go", "config": store.RedactManagedConfig(current)})
 	default:
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed", "invalid_request_error")
 	}
@@ -1818,8 +1875,12 @@ func (s *Server) storageInfo(w http.ResponseWriter, r *http.Request) {
 	if !s.requireAdmin(w, r) {
 		return
 	}
+	backend := "json"
+	if s.cfg.DatabaseURL != "" {
+		backend = "postgres"
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"backend":        "json",
+		"backend":        backend,
 		"data_dir":       s.cfg.DataDir,
 		"accounts_path":  s.cfg.AccountsPath,
 		"auth_keys_path": s.cfg.AuthKeysPath,
@@ -1920,14 +1981,14 @@ func positiveInt(raw string, fallback int) int {
 	return value
 }
 
-func accountForAPI(account map[string]any) map[string]any {
+func accountForAPI(account map[string]any, minimum ...time.Duration) map[string]any {
 	item := cloneMap(account)
 	ref := accountPublicRef(account)
 	if ref != "" {
 		item["id"] = ref
 		item["account_ref"] = ref
 	}
-	if token := accountToken(account); token != "" {
+	if token := firstNonEmpty(stringValue(account["access_token"]), stringValue(account["accessToken"])); token != "" {
 		item["has_access_token"] = true
 		item["token_preview"] = tokenPreview(token)
 	} else {
@@ -1937,7 +1998,13 @@ func accountForAPI(account map[string]any) map[string]any {
 	for _, key := range []string{"access_token", "accessToken", "token", "cookie_header", "session_token", "refresh_token", "id_token", "login_password", "password", "two_factor_secret", "totp_secret"} {
 		delete(item, key)
 	}
-	category := accountStatusCategory(item)
+	window := 5 * time.Minute
+	if len(minimum) > 0 {
+		window = minimum[0]
+	}
+	item["credential_readiness"] = accounts.CredentialReadiness(account, time.Now(), window)
+	item["has_refresh_token"] = stringValue(account["refresh_token"]) != ""
+	category := accountStatusCategory(account)
 	item["status_category"] = category
 	item["status_label"] = map[string]string{
 		"normal":   "正常",
@@ -1948,10 +2015,10 @@ func accountForAPI(account map[string]any) map[string]any {
 	return item
 }
 
-func accountsForAPI(items []map[string]any) []map[string]any {
+func accountsForAPI(items []map[string]any, minimum ...time.Duration) []map[string]any {
 	result := make([]map[string]any, 0, len(items))
 	for _, item := range items {
-		result = append(result, accountForAPI(item))
+		result = append(result, accountForAPI(item, minimum...))
 	}
 	return result
 }
@@ -1962,6 +2029,12 @@ func accountStatusCategory(account map[string]any) string {
 	errorKind := strings.ToLower(strings.TrimSpace(stringValue(account["last_error_kind"])))
 	if !boolValue(account["enabled"], true) || status == "disabled" || status == "auto_disabled" || status == "禁用" || reason == "disabled" {
 		return "disabled"
+	}
+	if isOpenAIAccount(accounts.Account{Token: accountToken(account), Fields: account}) {
+		readiness := accounts.CredentialReadiness(account, time.Now(), 5*time.Minute)
+		if readiness.State == "invalid" || (readiness.State == "expired" && !readiness.Recoverable) {
+			return "abnormal"
+		}
 	}
 	if status == "limited" || status == "rate_limited" || status == "cooling" || status == "backoff" || status == "限流" {
 		return "limited"
@@ -1990,10 +2063,13 @@ func accountStatusCategory(account map[string]any) string {
 // refresh token is retained so it can still be rotated, while browser/session
 // accounts with an expired or explicitly rejected access token are removable.
 func accountAutoRemoveInvalid(account map[string]any) bool {
+	if boolValue(account["refresh_uncertain"], false) || boolValue(account["refresh_inflight"], false) {
+		return false
+	}
 	if accountStatusCategory(account) != "abnormal" {
 		return false
 	}
-	if strings.TrimSpace(stringValue(account["refresh_token"])) != "" {
+	if strings.TrimSpace(stringValue(account["refresh_token"])) != "" && stringValue(account["refresh_token_invalid_at"]) == "" {
 		return false
 	}
 	if strings.TrimSpace(stringValue(account["login_password"])) != "" &&
@@ -2005,6 +2081,12 @@ func accountAutoRemoveInvalid(account map[string]any) bool {
 	reason := strings.ToLower(strings.TrimSpace(stringValue(account["status_reason_code"])))
 	errorKind := strings.ToLower(strings.TrimSpace(stringValue(account["last_error_kind"])))
 	errorStatus := intValue(account["last_error_status"])
+	if stringValue(account["last_remote_check_result"]) == "invalid" {
+		return true
+	}
+	if expiry, known := accounts.TokenExpiry(stringValue(account["access_token"])); known && !expiry.After(time.Now()) {
+		return true
+	}
 	if reason == "auth_invalid" || reason == "account_invalid" {
 		return true
 	}
@@ -2047,7 +2129,14 @@ func accountToken(account map[string]any) string {
 	if token := stringValue(account["access_token"]); token != "" {
 		return token
 	}
-	return stringValue(account["accessToken"])
+	if token := stringValue(account["accessToken"]); token != "" {
+		return token
+	}
+	if rt := stringValue(account["refresh_token"]); rt != "" {
+		digest := sha256.Sum256([]byte(rt))
+		return "rt-only:" + hex.EncodeToString(digest[:])
+	}
+	return ""
 }
 
 func accountPublicRef(account map[string]any) string {
@@ -2330,7 +2419,7 @@ func (s *Server) static(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) requireAPI(w http.ResponseWriter, r *http.Request) bool {
-	if s.auth.ValidAPIRequest(r) {
+	if _, ok := r.Context().Value(imageTaskOwnerKey{}).(string); ok || s.auth.ValidAPIRequest(r) {
 		return true
 	}
 	writeError(w, http.StatusUnauthorized, "invalid or missing API key", "authentication_error")

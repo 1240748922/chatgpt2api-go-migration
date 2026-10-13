@@ -18,8 +18,8 @@
           :class="isSidebarRail ? 'justify-center px-2' : 'justify-between px-6'"
         >
           <div class="flex w-full items-center" :class="isSidebarRail ? 'justify-center' : ''">
-            <p v-if="!isSidebarRail" class="ui-section-title">GPTGrok2API</p>
-            <span v-else class="text-sm font-semibold text-foreground" aria-label="GPTGrok2API">GG</span>
+            <p v-if="!isSidebarRail" class="ui-section-title">Chatgpt生图系统</p>
+            <span v-else class="text-sm font-semibold text-foreground" aria-label="Chatgpt生图系统">CG</span>
           </div>
         </div>
 
@@ -238,6 +238,15 @@
             </Button>
           </div>
         </header>
+
+        <div
+          v-if="routeLoadFailed"
+          role="alert"
+          class="mx-6 mt-4 flex flex-wrap items-center justify-between gap-3 rounded-lg border border-destructive/30 bg-destructive/5 p-4 text-sm lg:mx-10"
+        >
+          <p>页面模块加载失败，请重新加载页面。已提交的后台任务会继续执行。</p>
+          <Button size="sm" variant="outline" @click="refreshPage">重新加载页面</Button>
+        </div>
 
         <div
           class="relative h-full overflow-y-auto overflow-x-hidden bg-card"
@@ -595,6 +604,7 @@ const currentAuthToken = ref('')
 const thirdPartyApps = ref<Settings['third_party_apps'] | null>(null)
 const themeMode = ref<ThemeMode>(getStoredThemeMode())
 const isRoutePending = ref(false)
+const routeLoadFailed = ref(false)
 const pendingRouteTitle = ref('')
 const cachedRouteNames = ['Studio', 'Accounts', 'Logs', 'Monitor', 'Gallery', 'Proxy', 'Register', 'ICloud', 'Settings']
 const cachedRouteMax = cachedRouteNames.length
@@ -981,9 +991,9 @@ async function checkForUpdates(showMessage = true) {
     if (remoteReleases.length) {
       releaseEntries.value = remoteReleases
     }
-    const message = isNewerVersion(latestVersionLabel.value, currentVersionLabel.value)
+    const message = result.check_message || (isNewerVersion(latestVersionLabel.value, currentVersionLabel.value)
       ? `发现新版本：${latestVersionLabel.value}`
-      : `当前已是最新版本：${currentVersionLabel.value || latestVersionLabel.value}`
+      : `当前已是最新版本：${currentVersionLabel.value || latestVersionLabel.value}`)
     updateCheckMessage.value = message
     if (showMessage) {
       if (isNewerVersion(latestVersionLabel.value, currentVersionLabel.value)) toast.info(message)
@@ -1093,11 +1103,13 @@ function setupRoutePendingGuards() {
     }
     return true
   })
-  stopRoutePendingAfterEach = router.afterEach(() => {
+  stopRoutePendingAfterEach = router.afterEach((_to, _from, failure) => {
     stopRoutePending()
+    if (!failure) routeLoadFailed.value = false
   })
   stopRoutePendingError = router.onError(() => {
     stopRoutePending()
+    routeLoadFailed.value = true
   })
 }
 

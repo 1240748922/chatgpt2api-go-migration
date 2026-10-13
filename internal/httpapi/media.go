@@ -21,12 +21,12 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/auucoder/gptgrok2api-go/internal/accounts"
+	"github.com/auucoder/gptgrok2api-go/internal/mediafile"
 	"github.com/auucoder/gptgrok2api-go/internal/model"
 	"github.com/auucoder/gptgrok2api-go/internal/protocol"
 	"github.com/auucoder/gptgrok2api-go/internal/provider"
@@ -89,9 +89,16 @@ func (s *Server) imageGenerations(w http.ResponseWriter, r *http.Request) {
 		request.Size = "1024x1024"
 	}
 	if isOpenAIImageModel(request.Model) {
-		request.Size = provider.NormalizeOpenAIImageSize(request.Size)
+		request.Size = strings.TrimSpace(request.Size)
 	}
-	if request.ResponseFormat == "" {
+	if isOpenAIImageModel(request.Model) {
+		var err error
+		request.ResponseFormat, err = s.openAIImageResponseFormat(request.ResponseFormat)
+		if err != nil {
+			s.writeImageError(w, r, err)
+			return
+		}
+	} else if request.ResponseFormat == "" {
 		request.ResponseFormat = "url"
 	}
 	if request.Quality == "" {
@@ -118,11 +125,15 @@ func (s *Server) imageGenerations(w http.ResponseWriter, r *http.Request) {
 	if isOpenAIImageModel(request.Model) {
 		data, err := s.generateOpenAIImageData(r, r.Context(), request.Prompt, request.Model, request.Size, request.Quality, nil, request.ResponseFormat, requestPublicBase(r), request.N)
 		if err != nil {
-			writeError(w, upstreamStatus(err), err.Error(), "upstream_error")
+			s.writeImageError(w, r, err)
 			return
 		}
 		s.stageRequestMonitor(r, "image_response_ready", 99, map[string]any{"response_ms": s.requestMonitorElapsed(r)})
 		writeJSON(w, http.StatusOK, map[string]any{"created": time.Now().Unix(), "data": data})
+		return
+	}
+	r = s.reviewRequest(w, r, request.Prompt)
+	if r == nil {
 		return
 	}
 	s.stageRequestMonitor(r, "image_egress_waiting", 30, map[string]any{"egress_wait_ms": 0})
@@ -175,8 +186,17 @@ func (s *Server) generateOpenAIImageData(r *http.Request, ctx context.Context, p
 	if count < 1 {
 		count = 1
 	}
+	if err := s.checkContent(ctx, prompt); err != nil {
+		return nil, err
+	}
+	var optionsErr error
+	ctx, optionsErr = s.imageOptionsContext(ctx)
+	if optionsErr != nil {
+		return nil, optionsErr
+	}
 	results := make([][]map[string]string, count)
-	ctx, timeoutCancel := context.WithTimeout(ctx, imageRequestTotalTimeout(s.cfg.RequestTimeout))
+	consumptionID := newImportID()
+	ctx, timeoutCancel := context.WithTimeout(ctx, s.imageTotalBudget(ctx, count))
 	defer timeoutCancel()
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -194,11 +214,23 @@ func (s *Server) generateOpenAIImageData(r *http.Request, ctx context.Context, p
 		default:
 		}
 	}
+	parallelism := count
+	if !s.imagePolicy(ctx).Parallel {
+		parallelism = 1
+	}
+	workers := make(chan struct{}, parallelism)
 	for index := 0; index < count; index++ {
 		index := index
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			select {
+			case workers <- struct{}{}:
+			case <-ctx.Done():
+				sendErr(ctx.Err())
+				return
+			}
+			defer func() { <-workers }()
 			releaseSlot, slotErr := s.acquireImageSlot(ctx, r)
 			if slotErr != nil {
 				sendErr(slotErr)
@@ -210,7 +242,10 @@ func (s *Server) generateOpenAIImageData(r *http.Request, ctx context.Context, p
 			for attempt := 0; attempt <= s.cfg.ChatMaxRetries; attempt++ {
 				accountStarted := time.Now()
 				s.stageRequestMonitor(r, "image_egress_waiting", 30, map[string]any{"egress_wait_ms": 0})
-				lease, reserveErr := s.accountPool.ReserveMatchingLimit(ctx, []string{"basic", "super", "heavy"}, excluded, isOpenAIAccount, s.cfg.ImageAccountLimit)
+				eligible := func(a accounts.Account) bool {
+					return imageModelAccount(a, model) && accounts.ImageEligible(a.Fields, len(inputs) > 0 && !provider.IsCodexImageModel(model), time.Now(), s.imageMinimumValidity(ctx))
+				}
+				lease, reserveErr := s.accountPool.ReserveMatchingLimit(ctx, []string{"basic", "super", "heavy"}, excluded, eligible, s.imagePolicy(ctx).AccountLimit)
 				if reserveErr != nil {
 					sendErr(reserveErr)
 					cancel()
@@ -219,12 +254,44 @@ func (s *Server) generateOpenAIImageData(r *http.Request, ctx context.Context, p
 				s.enrichMonitorAccount(r, lease.Account)
 				s.stageRequestMonitor(r, "image_getting_account", 35, map[string]any{"account_wait_ms": time.Since(accountStarted).Milliseconds()})
 
-				generated, generateErr := s.openAIImage.Generate(ctx, lease.Account, prompt, model, size, quality, inputs)
+				parentCtx := ctx
+				flowCtx := provider.WithImageCheckpoint(lease.Context, func(e provider.ImageCheckpoint) error {
+					if err := provider.NotifyImageCheckpoint(parentCtx, e); err != nil {
+						return err
+					}
+					if e.Stage == "result_ready" {
+						receipt := e.ConversationID
+						if receipt == "" {
+							receipt, _ = parentCtx.Value(imageDeliveryKey{}).(string)
+							if receipt == "" {
+								receipt = fmt.Sprintf("%s:%d:%d", consumptionID, index, attempt)
+							}
+						}
+						if err := s.store.ConsumeImageQuota(firstNonEmpty(stringValue(e.Account.Fields["id"]), e.Account.Token), receipt); err != nil {
+							return fmt.Errorf("persist image quota consumption: %w", err)
+						}
+					}
+					return nil
+				})
+				var generated []provider.ImageResult
+				var generateErr error
+				if provider.IsCodexImageModel(model) {
+					generated, generateErr = s.openAIImage.GenerateCodex(flowCtx, lease.Account, prompt, model, size, quality, inputs)
+				} else {
+					generated, generateErr = s.openAIImage.Generate(flowCtx, lease.Account, prompt, model, size, quality, inputs)
+				}
 				if generateErr != nil {
+					s.recordImageAttempt(r, index+1, attempt+1, lease.Account, time.Since(accountStarted), generateErr)
+					feedbackErr := s.imageFailureFeedback(lease.Account, generateErr)
 					s.accountPool.Release(lease)
-					s.accountPool.Feedback(lease.Account, upstreamStatus(generateErr), generateErr)
+					if feedbackErr != nil {
+						sendErr(fmt.Errorf("persist image account restriction: %w", feedbackErr))
+						cancel()
+						return
+					}
 					excluded[lease.Account.Token] = true
-					if s.shouldRetry(upstreamStatus(generateErr), attempt) {
+					var flow *provider.ImageFlowError
+					if errors.As(generateErr, &flow) && !flow.Submitted && s.shouldRetry(upstreamStatus(generateErr), attempt) {
 						continue
 					}
 					sendErr(generateErr)
@@ -235,9 +302,13 @@ func (s *Server) generateOpenAIImageData(r *http.Request, ctx context.Context, p
 				items := make([]map[string]string, 0, len(generated))
 				var resolveErr error
 				for _, image := range generated {
-					value, localURL, err := s.openAIImage.Resolve(ctx, lease.Account, image, responseFormat, s.cfg.ImageDataDir, publicBase)
+					deliveryCtx := lease.Context
+					if deliveryCtx.Value(imageDeliveryKey{}) == nil {
+						deliveryCtx = context.WithValue(deliveryCtx, imageDeliveryKey{}, fmt.Sprintf("%s:%d", consumptionID, index))
+					}
+					value, localURL, err := s.resolveOpenAIImage(deliveryCtx, lease.Account, image, size, responseFormat, publicBase)
 					if err != nil {
-						resolveErr = err
+						resolveErr = &provider.ImageFlowError{Stage: "storage", Submitted: true, Cause: err}
 						break
 					}
 					s.recordGeneratedMedia(ctx, map[string]string{"url": localURL})
@@ -248,19 +319,17 @@ func (s *Server) generateOpenAIImageData(r *http.Request, ctx context.Context, p
 					break
 				}
 				if resolveErr != nil {
+					s.recordImageAttempt(r, index+1, attempt+1, lease.Account, time.Since(accountStarted), resolveErr)
 					s.accountPool.Release(lease)
-					s.accountPool.Feedback(lease.Account, upstreamStatus(resolveErr), resolveErr)
-					excluded[lease.Account.Token] = true
-					if s.shouldRetry(upstreamStatus(resolveErr), attempt) {
-						continue
-					}
+					// The image already exists upstream. A delivery error must never
+					// consume another account or create a replacement conversation.
 					sendErr(resolveErr)
 					cancel()
 					return
 				}
 				s.accountPool.Release(lease)
+				s.recordImageAttempt(r, index+1, attempt+1, lease.Account, time.Since(accountStarted), nil)
 				s.stageRequestMonitor(r, "image_response_ready", 95, map[string]any{"response_ms": time.Since(accountStarted).Milliseconds()})
-				s.accountPool.Feedback(lease.Account, http.StatusOK, nil)
 				results[index] = items
 				return
 			}
@@ -767,10 +836,14 @@ func (s *Server) imageEdits(w http.ResponseWriter, r *http.Request) {
 		if size == "" {
 			size = "1024x1024"
 		}
-		format := imageEditResponseFormat(request.ResponseFormat)
+		format, err := s.openAIImageResponseFormat(request.ResponseFormat)
+		if err != nil {
+			s.writeImageError(w, r, err)
+			return
+		}
 		data, err := s.generateOpenAIImageData(r, r.Context(), prompt, modelName, size, request.Quality, inputs, format, requestPublicBase(r), n)
 		if err != nil {
-			writeError(w, upstreamStatus(err), err.Error(), "upstream_error")
+			s.writeImageError(w, r, err)
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"created": time.Now().Unix(), "data": data})
@@ -917,20 +990,23 @@ func (s *Server) serveMediaFile(w http.ResponseWriter, r *http.Request, root, ki
 		writeError(w, http.StatusBadRequest, "invalid file ID", "invalid_request_error")
 		return
 	}
-	entries, _ := os.ReadDir(root)
-	for _, entry := range entries {
-		if !entry.IsDir() && strings.HasPrefix(entry.Name(), id+".") {
-			path := filepath.Join(root, entry.Name())
-			if !isWithin(root, path) {
-				continue
-			}
-			if kind == "video" {
-				w.Header().Set("Content-Type", "video/mp4")
-			} else {
-				w.Header().Set("Content-Type", mime.TypeByExtension(filepath.Ext(path)))
-			}
+	exts := []string{".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
+	if kind == "video" {
+		exts = []string{".mp4", ".webm"}
+	}
+	for _, ext := range exts {
+		path := filepath.Join(root, id+ext)
+		if info, err := os.Lstat(path); err == nil && info.Mode().IsRegular() {
+			w.Header().Set("Content-Type", mime.TypeByExtension(ext))
 			http.ServeFile(w, r, path)
 			return
+		}
+	}
+	if kind == "image" {
+		for _, ext := range exts {
+			if s.serveRemoteImage(w, r, id+ext) {
+				return
+			}
 		}
 	}
 	writeError(w, http.StatusNotFound, kind+" file not found", "not_found")
@@ -944,7 +1020,32 @@ func mediaPools(modelName string) []string {
 }
 
 func isOpenAIImageModel(modelName string) bool {
-	return strings.EqualFold(strings.TrimSpace(modelName), "gpt-image-2")
+	if provider.IsCodexImageModel(modelName) {
+		return true
+	}
+	switch strings.ToLower(strings.TrimSpace(modelName)) {
+	case "gpt-image-2", "gpt-image-2.5", "gpt-image-2.5-flare", "gpt-image-2.5-sunburst":
+		return true
+	}
+	return false
+}
+
+func imageModelAccount(a accounts.Account, modelName string) bool {
+	if !isOpenAIAccount(a) {
+		return false
+	}
+	codex := stringValue(a.Fields["source_type"]) == "codex"
+	if !provider.IsCodexImageModel(modelName) {
+		return !codex
+	}
+	if !codex {
+		return false
+	}
+	plan := strings.ToLower(firstNonEmpty(stringValue(a.Fields["plan_type"]), stringValue(a.Fields["type"])))
+	if plan != "plus" && plan != "team" && plan != "pro" {
+		return false
+	}
+	return modelName == "codex-gpt-image-2" || modelName == plan+"-codex-gpt-image-2"
 }
 
 func validOpenAIImageSize(size string) bool {
@@ -952,13 +1053,8 @@ func validOpenAIImageSize(size string) bool {
 	if value == "" || value == "auto" {
 		return true
 	}
-	parts := strings.Split(value, "x")
-	if len(parts) != 2 {
-		return false
-	}
-	w, e1 := strconv.Atoi(parts[0])
-	h, e2 := strconv.Atoi(parts[1])
-	return e1 == nil && e2 == nil && w > 0 && h > 0
+	_, _, err := mediafile.Dimensions(value)
+	return err == nil
 }
 
 func isOpenAIAccount(account accounts.Account) bool {
@@ -1000,6 +1096,9 @@ func collectImageEvents(reader io.Reader) []provider.ImageResult {
 }
 
 func requestPublicBase(r *http.Request) string {
+	if value, ok := r.Context().Value(imageTaskPublicBaseKey{}).(string); ok {
+		return value
+	}
 	for _, key := range []string{"GO_PUBLIC_BASE_URL", "CHATGPT2API_BASE_URL"} {
 		if value := normalizePublicBaseURL(os.Getenv(key)); value != "" {
 			return value

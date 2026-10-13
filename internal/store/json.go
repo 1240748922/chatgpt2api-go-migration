@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -25,6 +26,16 @@ type Identity struct {
 }
 
 type Store struct {
+	logsMu           sync.Mutex
+	closed           bool
+	metricsMu        sync.Mutex
+	latencies        []latencySample
+	pg               *sql.DB
+	pgItems          map[string]map[string]any
+	pgSnapshotAt     time.Time
+	documentMu       sync.Mutex
+	leaseMu          sync.Mutex
+	localLeases      map[string]localLease
 	accountsPath     string
 	authKeysPath     string
 	configPath       string
@@ -65,6 +76,9 @@ func (s *Store) LoadAccounts() ([]map[string]any, error) {
 }
 
 func (s *Store) SaveAccounts(items []map[string]any) error {
+	if s.pg != nil {
+		return errors.New("bulk account replacement is disabled for shared storage; use account mutations")
+	}
 	s.accountsWriteMu.Lock()
 	defer s.accountsWriteMu.Unlock()
 	s.mu.Lock()
@@ -81,6 +95,9 @@ func (s *Store) SaveAccounts(items []map[string]any) error {
 // AccountSnapshot returns an immutable in-memory account view. Callers must
 // not mutate the returned slice or maps. Store mutations always use copy-on-write.
 func (s *Store) AccountSnapshot() ([]map[string]any, uint64, error) {
+	if s.pg != nil {
+		return s.pgSnapshot()
+	}
 	s.mu.RLock()
 	if s.accountsLoaded {
 		items, revision := s.accountsCache, s.accountsRevision
@@ -98,24 +115,38 @@ func (s *Store) AccountSnapshot() ([]map[string]any, uint64, error) {
 }
 
 func (s *Store) LoadAuthKeys() ([]map[string]any, error) {
+	if s.pg != nil {
+		doc, err := s.Document("auth-keys")
+		return docItems(doc), err
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return loadItems(s.authKeysPath)
 }
 
 func (s *Store) SaveAuthKeys(items []map[string]any) error {
+	if s.pg != nil {
+		_, err := s.MutateDocument("auth-keys", func(doc map[string]any) error { doc["items"] = items; return nil })
+		return err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return writeJSON(s.authKeysPath, map[string]any{"items": items})
 }
 
 func (s *Store) Config() (map[string]any, error) {
+	if s.pg != nil {
+		return s.Document("config")
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return loadMap(s.configPath)
 }
 
 func (s *Store) UpdateConfig(key string, value any) (map[string]any, error) {
+	if s.pg != nil {
+		return s.MutateDocument("config", func(m map[string]any) error { m[key] = value; return nil })
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	current, err := loadMap(s.configPath)
@@ -130,6 +161,9 @@ func (s *Store) UpdateConfig(key string, value any) (map[string]any, error) {
 }
 
 func (s *Store) MutateConfig(key string, mutate func(any) (any, error)) (map[string]any, error) {
+	if s.pg != nil {
+		return s.MutateDocument("config", func(m map[string]any) error { v, err := mutate(m[key]); m[key] = v; return err })
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	current, err := loadMap(s.configPath)
@@ -148,12 +182,49 @@ func (s *Store) MutateConfig(key string, mutate func(any) (any, error)) (map[str
 }
 
 func (s *Store) ReplaceConfig(value map[string]any) error {
+	if s.pg != nil {
+		_, err := s.MutateDocument("config", func(m map[string]any) error {
+			for k := range m {
+				delete(m, k)
+			}
+			for k, v := range value {
+				m[k] = v
+			}
+			return nil
+		})
+		return err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return writeJSON(s.configPath, value)
 }
 
+// PatchConfig merges under one transaction/lock, preserving concurrent UI changes.
+func (s *Store) PatchConfig(updates map[string]any) (map[string]any, error) {
+	if s.pg != nil {
+		return s.MutateDocument("config", func(d map[string]any) error {
+			for k, v := range updates {
+				d[k] = v
+			}
+			return nil
+		})
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	d, err := loadMap(s.configPath)
+	if err != nil {
+		return nil, err
+	}
+	for k, v := range updates {
+		d[k] = v
+	}
+	return d, writeJSON(s.configPath, d)
+}
+
 func (s *Store) Authenticate(token string) (Identity, bool) {
+	if s.pg != nil {
+		return s.pgAuthenticate(strings.TrimSpace(token))
+	}
 	token = strings.TrimSpace(token)
 	if token == "" {
 		return Identity{}, false
@@ -185,6 +256,16 @@ func (s *Store) Authenticate(token string) (Identity, bool) {
 }
 
 func (s *Store) ListPublicKeys(role string) ([]map[string]any, error) {
+	if s.pg != nil {
+		items, err := s.LoadAuthKeys()
+		result := []map[string]any{}
+		for _, item := range items {
+			if role == "" || strings.EqualFold(role, stringValue(item["role"])) {
+				result = append(result, publicKey(item))
+			}
+		}
+		return result, err
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	items, err := loadItems(s.authKeysPath)
@@ -202,6 +283,9 @@ func (s *Store) ListPublicKeys(role string) ([]map[string]any, error) {
 }
 
 func (s *Store) CreateKey(role, name, adminKey string) (map[string]any, string, error) {
+	if s.pg != nil {
+		return s.pgCreateKey(role, name, adminKey)
+	}
 	role = strings.ToLower(strings.TrimSpace(role))
 	if role != "admin" && role != "user" {
 		return nil, "", errors.New("invalid key role")
@@ -244,6 +328,9 @@ func (s *Store) CreateKey(role, name, adminKey string) (map[string]any, string, 
 }
 
 func (s *Store) UpdateKey(id, role string, updates map[string]any, adminKey string) (map[string]any, error) {
+	if s.pg != nil {
+		return s.pgUpdateKey(id, role, updates, adminKey)
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	items, err := loadItems(s.authKeysPath)
@@ -284,6 +371,9 @@ func (s *Store) UpdateKey(id, role string, updates map[string]any, adminKey stri
 }
 
 func (s *Store) DeleteKey(id, role string) error {
+	if s.pg != nil {
+		return s.pgDeleteKey(id, role)
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	items, err := loadItems(s.authKeysPath)
@@ -314,6 +404,9 @@ func (s *Store) AccountList() ([]map[string]any, error) {
 }
 
 func (s *Store) AddAccounts(tokens []string, payloads []map[string]any) (int, int, []map[string]any, error) {
+	if s.pg != nil {
+		return s.pgAdd(tokens, payloads)
+	}
 	s.accountsWriteMu.Lock()
 	defer s.accountsWriteMu.Unlock()
 	s.mu.Lock()
@@ -323,9 +416,13 @@ func (s *Store) AddAccounts(tokens []string, payloads []map[string]any) (int, in
 	}
 	accounts := cloneAccountList(s.accountsCache)
 	byToken := make(map[string]int, len(accounts))
+	byRT := make(map[string]bool, len(accounts))
 	for index, item := range accounts {
 		if token := accountToken(item); token != "" {
 			byToken[token] = index
+		}
+		if rt := stringValue(item["refresh_token"]); rt != "" {
+			byRT[rt] = true
 		}
 	}
 	added, skipped := 0, 0
@@ -338,10 +435,17 @@ func (s *Store) AddAccounts(tokens []string, payloads []map[string]any) (int, in
 			skipped++
 			continue
 		}
+		if rt := stringValue(payload["refresh_token"]); rt != "" && byRT[rt] {
+			skipped++
+			continue
+		}
 		item := cloneMap(payload)
 		normalizeAccount(item)
 		accounts = append(accounts, item)
 		byToken[token] = len(accounts) - 1
+		if rt := stringValue(item["refresh_token"]); rt != "" {
+			byRT[rt] = true
+		}
 		added++
 	}
 	for _, rawToken := range tokens {
@@ -376,6 +480,9 @@ func (s *Store) AddAccounts(tokens []string, payloads []map[string]any) (int, in
 }
 
 func (s *Store) DeleteAccounts(tokens []string) (int, []map[string]any, error) {
+	if s.pg != nil {
+		return s.pgDelete(tokens)
+	}
 	s.accountsWriteMu.Lock()
 	defer s.accountsWriteMu.Unlock()
 	s.mu.Lock()
@@ -410,6 +517,10 @@ func (s *Store) DeleteAccounts(tokens []string) (int, []map[string]any, error) {
 }
 
 func (s *Store) UpdateAccount(token string, updates map[string]any) (map[string]any, []map[string]any, error) {
+	if s.pg != nil {
+		item, err := s.pgUpdate(token, updates)
+		return item, nil, err
+	}
 	s.accountsWriteMu.Lock()
 	defer s.accountsWriteMu.Unlock()
 	s.mu.Lock()
@@ -437,6 +548,9 @@ func (s *Store) UpdateAccount(token string, updates map[string]any) (map[string]
 // and coalesces disk writes. This avoids rewriting a large account file for
 // every concurrent success, timeout, or proxy failure.
 func (s *Store) UpdateAccountRuntime(token string, updates map[string]any) (map[string]any, error) {
+	if s.pg != nil {
+		return s.pgUpdate(token, updates)
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.loadAccountsLocked(); err != nil {
@@ -466,6 +580,11 @@ func (s *Store) FlushAccounts() error {
 // the lookup key. Keeping this operation in Store avoids a race between a
 // refresh-token rotation and another concurrent account update.
 func (s *Store) RotateAccountTokens(oldToken, newToken, refreshToken, idToken string, fields map[string]any) (map[string]any, []map[string]any, error) {
+	return s.UpdateAccount(oldToken, RotationUpdates(newToken, refreshToken, idToken, fields))
+}
+
+// RotationUpdates is also used by credential workers that write under a fence.
+func RotationUpdates(newToken, refreshToken, idToken string, fields map[string]any) map[string]any {
 	updates := cloneMap(fields)
 	if strings.TrimSpace(newToken) != "" {
 		updates["access_token"] = strings.TrimSpace(newToken)
@@ -498,7 +617,7 @@ func (s *Store) RotateAccountTokens(oldToken, newToken, refreshToken, idToken st
 	} {
 		updates[key] = nil
 	}
-	return s.UpdateAccount(oldToken, updates)
+	return updates
 }
 
 func (s *Store) loadAccountsLocked() error {
@@ -539,6 +658,9 @@ func (s *Store) updatedAccountsLocked(token string, updates map[string]any) ([]m
 }
 
 func (s *Store) scheduleAccountFlushLocked(delay time.Duration) {
+	if s.closed {
+		return
+	}
 	if delay <= 0 {
 		delay = accountRuntimeFlushDelay
 	}
@@ -554,6 +676,9 @@ func (s *Store) scheduleAccountFlushLocked(delay time.Duration) {
 }
 
 func (s *Store) persistRuntimeAccounts() error {
+	if s.pg != nil {
+		return nil
+	}
 	s.accountsWriteMu.Lock()
 	defer s.accountsWriteMu.Unlock()
 
@@ -819,10 +944,19 @@ func accountToken(item map[string]any) string {
 	if token := stringValue(item["access_token"]); token != "" {
 		return token
 	}
-	return stringValue(item["accessToken"])
+	if token := stringValue(item["accessToken"]); token != "" {
+		return token
+	}
+	if rt := stringValue(item["refresh_token"]); rt != "" {
+		return "rt-only:" + hashKey(rt)
+	}
+	return ""
 }
 
 func normalizeAccount(item map[string]any) {
+	if stringValue(item["id"]) == "" {
+		item["id"] = randomID()
+	}
 	if _, ok := item["access_token"]; !ok {
 		if token := stringValue(item["accessToken"]); token != "" {
 			item["access_token"] = token

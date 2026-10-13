@@ -11,6 +11,7 @@ import (
 )
 
 type Config struct {
+	DatabaseURL            string
 	RootDir                string
 	ListenAddr             string
 	DataDir                string
@@ -58,6 +59,7 @@ type Config struct {
 	ImageDataDir           string
 	VideoDataDir           string
 	OAuthPath              string
+	OAuthEncryptionKey     string
 	QueuePath              string
 	RegisterPath           string
 	GrokAccountsPath       string
@@ -137,7 +139,7 @@ func Load(root string) (Config, error) {
 	if imageMaxConcurrency > 1024 {
 		imageMaxConcurrency = 1024
 	}
-	imageRetentionDays := envInt("GO_IMAGE_RETENTION_DAYS", 1)
+	imageRetentionDays := envInt("GO_IMAGE_RETENTION_DAYS", 15)
 	if imageRetentionDays < 1 {
 		imageRetentionDays = 1
 	}
@@ -150,6 +152,7 @@ func Load(root string) (Config, error) {
 	}
 
 	cfg := Config{
+		DatabaseURL:            strings.TrimSpace(os.Getenv("GO_DATABASE_URL")),
 		RootDir:                root,
 		ListenAddr:             env("GO_LISTEN_ADDR", env("CHATGPT2API_LISTEN_ADDR", ":8080")),
 		DataDir:                resolvePath(root, env("GROK_DATA_DIR", "data")),
@@ -195,6 +198,7 @@ func Load(root string) (Config, error) {
 		ImageDataDir:           resolvePath(root, env("GO_IMAGE_DATA_DIR", filepath.Join("data", "files", "images"))),
 		VideoDataDir:           resolvePath(root, env("GO_VIDEO_DATA_DIR", filepath.Join("data", "files", "videos"))),
 		OAuthPath:              resolvePath(root, env("GO_OAUTH_PATH", filepath.Join("data", "oauth_accounts.json.enc"))),
+		OAuthEncryptionKey:     strings.TrimSpace(os.Getenv("GO_OAUTH_ENCRYPTION_KEY")),
 		QueuePath:              resolvePath(root, env("GO_QUEUE_PATH", filepath.Join("data", "tasks.json"))),
 		RegisterPath:           resolvePath(root, env("GO_REGISTER_PATH", filepath.Join("data", "register.json"))),
 		GrokAccountsPath:       resolvePath(root, env("GO_GROK_ACCOUNTS_PATH", filepath.Join("data", "grok_accounts.json"))),
@@ -202,7 +206,7 @@ func Load(root string) (Config, error) {
 		RegisterCaptchaURL:     strings.TrimRight(strings.TrimSpace(os.Getenv("GO_REGISTER_CAPTCHA_URL")), "/"),
 		RegisterDriverURL:      strings.TrimRight(strings.TrimSpace(os.Getenv("GO_REGISTER_DRIVER_URL")), "/"),
 		RegisterDriverKey:      strings.TrimSpace(os.Getenv("GO_REGISTER_DRIVER_KEY")),
-		Version:                env("GO_VERSION", "1.2.4-go"),
+		Version:                env("GO_VERSION", "3.3.0-go.local"),
 		AllowAnonymous:         envBool("GO_ALLOW_ANONYMOUS", false),
 		RequestTimeout:         time.Duration(requestTimeoutSeconds) * time.Second,
 		ChatMaxRetries:         chatMaxRetries,
@@ -232,17 +236,20 @@ func Load(root string) (Config, error) {
 	if err != nil && !os.IsNotExist(err) {
 		return Config{}, fmt.Errorf("read config: %w", err)
 	}
-	if cfg.APIKey == "" {
-		cfg.APIKey = firstString(rawConfig, "auth-key", "api_key")
+	for _, name := range []string{"auth-key", "api_key"} {
+		if value, exists := rawConfig[name]; exists {
+			cfg.APIKey, _ = value.(string)
+			break
+		}
 	}
-	if cfg.AdminKey == "" {
-		cfg.AdminKey = firstString(rawConfig, "app_key", "admin_key")
+	for _, name := range []string{"app_key", "admin_key"} {
+		if value, exists := rawConfig[name]; exists {
+			cfg.AdminKey, _ = value.(string)
+			break
+		}
 	}
 	if cfg.WebUIKey == "" {
 		cfg.WebUIKey = firstString(rawConfig, "webui_key")
-	}
-	if cfg.APIKey == "" && cfg.AdminKey != "" {
-		cfg.APIKey = cfg.AdminKey
 	}
 	applyProxyConfig(&cfg, rawConfig)
 

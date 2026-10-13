@@ -1,15 +1,11 @@
-import { ref } from 'vue'
-
-import { accountsApi } from '@/api/accounts'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { accountImportsApi } from '@/api/accountImports'
-import { useConfirmDialog } from '@/composables/useConfirmDialog'
+import { importJobsApi, type ImportJob } from '@/api/importJobs'
+import { parseAccountCredentials, type ImportedCredential } from '@/lib/accountCredentials'
 import { useToast } from '@/composables/useToast'
 import type { useAccountBulkProgressRuntime } from './accountBulkProgressRuntime'
 
-export type AccountImportMode = 'oauth_login' | 'access_token' | 'session_json' | 'cpa_json' | 'remote_cpa' | 'sub2api'
-
-const IMPORT_BATCH_SIZE = 20
-
+export type AccountImportMode = 'oauth_login' | 'access_token' | 'refresh_token' | 'session_json' | 'cpa_json' | 'remote_cpa' | 'sub2api'
 type AccountImportRuntimeOptions = {
   bulkProgress: ReturnType<typeof useAccountBulkProgressRuntime>
   normalizeErrorMessage: (error: unknown) => string
@@ -17,79 +13,10 @@ type AccountImportRuntimeOptions = {
   loadData: (options?: { silentErrorToast?: boolean }) => Promise<void>
 }
 
-function uniqueTokens(tokens: string[]) {
-  return Array.from(new Set(tokens.map((token) => token.trim()).filter(Boolean)))
-}
-
-function parseTokenLines(text: string) {
-  return uniqueTokens(
-    text
-      .split(/\r?\n/)
-      .map((line) => line.trim())
-      .filter((line) => line && !line.startsWith('#')),
-  )
-}
-
-type AccountImportPayload = Record<string, unknown>
-
-function accountPayloadToken(value: unknown): string {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return ''
-  const source = value as AccountImportPayload
-  return String(source.access_token || source.accessToken || '').trim()
-}
-
-function parseSessionJsonAccount(rawText: string): AccountImportPayload {
-  const text = rawText.trim()
-  if (!text) throw new Error('请先粘贴 Session JSON')
-  const parsed = JSON.parse(text)
-  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-    throw new Error('Session JSON 格式不正确')
-  }
-  const source = parsed as AccountImportPayload
-  const token = accountPayloadToken(source)
-  if (!token) throw new Error('Session JSON 中没有找到 accessToken')
-  return {
-    ...source,
-    access_token: token,
-    type: source.type || source.plan_type || 'free',
-    source_type: source.source_type || source.sourceType || 'session_json',
-  }
-}
-
-function tokenFromCPAAccount(value: unknown): string {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return ''
-  const source = value as Record<string, unknown>
-  return String(source.access_token || source.accessToken || '').trim()
-}
-
-function parseCPAJsonTokens(rawText: string, label: string) {
-  const text = rawText.trim()
-  if (!text) throw new Error(`${label} 是空文件`)
-  const parsed = JSON.parse(text)
-  const candidates: unknown[] = []
-
-  if (Array.isArray(parsed)) {
-    candidates.push(...parsed)
-  } else if (parsed && typeof parsed === 'object') {
-    if (tokenFromCPAAccount(parsed)) {
-      candidates.push(parsed)
-    } else {
-      const source = parsed as Record<string, unknown>
-      for (const key of ['accounts', 'items', 'data', 'results']) {
-        const rows = source[key]
-        if (Array.isArray(rows)) candidates.push(...rows)
-      }
-    }
-  }
-
-  const tokens = uniqueTokens(candidates.map(tokenFromCPAAccount).filter(Boolean))
-  if (!tokens.length) throw new Error(`${label} 中没有找到 access_token`)
-  return tokens
-}
-
 export function useAccountImportRuntime(options: AccountImportRuntimeOptions) {
   const importBusy = ref(false)
   const showImportModal = ref(false)
+  const importMinimized = ref(false)
   const importMode = ref<AccountImportMode>('access_token')
   const oauthEmailHint = ref('')
   const oauthCallbackText = ref('')
@@ -98,184 +25,112 @@ export function useAccountImportRuntime(options: AccountImportRuntimeOptions) {
   const oauthRedirectUriPrefix = ref('')
   const manualTokenText = ref('')
   const sessionJsonText = ref('')
+  const importJob = ref<ImportJob | null>(null)
+  const importJobs = ref<ImportJob[]>([])
+  const importMonitorError = ref('')
   const toast = useToast()
-  const confirmDialog = useConfirmDialog()
-
+  let parsedFileRows: ImportedCredential[] = []
+  let parsedFilePreview = ''
+  let timer: ReturnType<typeof setTimeout> | undefined
+  let stopped = false
+  const importRunning = computed(() => ['queued', 'running'].includes(importJob.value?.status || ''))
   const importModeOptions = [
-    { label: 'OAuth 登录已有账号', value: 'oauth_login' },
-    { label: '导入 Access Token', value: 'access_token' },
+    { label: '导入 AT / JSON', value: 'access_token' },
+    { label: '导入 Refresh Token', value: 'refresh_token' },
     { label: '导入 Session JSON', value: 'session_json' },
     { label: '导入 CPA JSON 文件', value: 'cpa_json' },
+    { label: 'OAuth 登录已有账号', value: 'oauth_login' },
     { label: '从远程 CPA 服务器导入', value: 'remote_cpa' },
     { label: '从 Sub2API 服务器导入', value: 'sub2api' },
   ] as const
-
-  function setImportMode(mode: AccountImportMode) {
-    importMode.value = mode
-  }
-
+  function setImportMode(mode: AccountImportMode) { importMode.value = mode }
   async function openImportModal(mode: AccountImportMode = 'access_token') {
     showImportModal.value = true
+    importMinimized.value = false
     setImportMode(mode)
+    await refreshImportJobs()
   }
-
-  function closeImportModal() {
-    if (importBusy.value) return
-    showImportModal.value = false
+  function closeImportModal() { showImportModal.value = false; importMinimized.value = false }
+  function minimizeImportModal() { showImportModal.value = false; importMinimized.value = true }
+  async function refreshImportJobs() {
+    try { importJobs.value = (await importJobsApi.list()).jobs } catch (error) { importMonitorError.value = options.normalizeErrorMessage(error) }
   }
-
-  async function promptRemoveImportedAbnormalAccounts(importedTokens: string[], errorCount: number) {
-    if (errorCount <= 0 || options.bulkProgress.bulkStopRequested.value) return
-
-    let preview: Awaited<ReturnType<typeof accountsApi.cleanupImportedAbnormalAccounts>>
+  async function pollJob() {
+    if (stopped || !importJob.value) return
+    const id = importJob.value.id
     try {
-      preview = await accountsApi.cleanupImportedAbnormalAccounts(importedTokens, false)
-    } catch (error) {
-      options.setError('检查本次异常账号失败，已先保留', error)
-      return
-    }
-
-    if (!preview.abnormal) {
-      toast.info('本次导入有刷新异常，但没有找到可清理的异常账号，可能未写入本地或状态已变化')
-      return
-    }
-
-    const confirmed = await confirmDialog.ask({
-      title: '移除本次异常账号？',
-      message: `本次导入刷新返回 ${errorCount} 条异常。\n后端确认 ${preview.abnormal} 个本次导入账号当前状态为异常，是否直接删除？\n\n只会删除本次导入且状态为异常的账号，正常、限流和历史账号会保留。`,
-      confirmText: `删除 ${preview.abnormal} 个`,
-      cancelText: '先保留',
-    })
-
-    if (!confirmed) return
-
-    try {
-      const result = await accountsApi.cleanupImportedAbnormalAccounts(importedTokens, true)
-      toast.success(`已移除 ${result.removed || 0} 个本次异常账号`)
-    } catch (error) {
-      options.setError('移除本次异常账号失败', error)
-    } finally {
-      await options.loadData({ silentErrorToast: true })
-    }
+      const next = await importJobsApi.get(id)
+      if (stopped || importJob.value?.id !== id) return
+      const wasRunning = importRunning.value
+      importJob.value = next
+      importMonitorError.value = ''
+      if (wasRunning && !importRunning.value) {
+        await options.loadData({ silentErrorToast: true })
+        await refreshImportJobs()
+      }
+    } catch (error) { importMonitorError.value = options.normalizeErrorMessage(error) }
+    if (!stopped && importRunning.value) timer = setTimeout(() => void pollJob(), 1500)
   }
-
-  async function importAccountPayloadBatch(accountPayloads: AccountImportPayload[], sourceType: string, title: string) {
-    const payloadsByToken = new Map<string, AccountImportPayload>()
-    for (const payload of accountPayloads) {
-      const accessToken = accountPayloadToken(payload)
-      if (accessToken) payloadsByToken.set(accessToken, payload)
-    }
-    const normalizedAccountPayloads = Array.from(payloadsByToken.values())
-    const normalizedTokens = Array.from(payloadsByToken.keys())
-    if (!normalizedAccountPayloads.length) {
-      toast.warning('没有可导入的 access token')
-      return
-    }
-
-    const confirmed = await confirmDialog.ask({
-      title,
-      message: `即将导入 ${normalizedTokens.length} 个账号，已存在账号会刷新远端信息。是否继续？`,
-      confirmText: '确认导入',
-      cancelText: '取消',
-    })
-    if (!confirmed) return
-
+  function selectImportJob(job: ImportJob) {
+    if (timer) clearTimeout(timer)
+    importJob.value = job
+    void pollJob()
+  }
+  onMounted(async () => {
+    await refreshImportJobs()
+    if (stopped) return
+    const running = importJobs.value.find(j => ['queued', 'running'].includes(j.status))
+    if (running) { importMinimized.value = true; selectImportJob(running) }
+  })
+  onBeforeUnmount(() => { stopped = true; if (timer) clearTimeout(timer) })
+  async function startImport(rows: ImportedCredential[]) {
+    if (importBusy.value || importRunning.value) return
     importBusy.value = true
-    options.bulkProgress.start(title, normalizedTokens.length, 'mutation')
-    let addedCount = 0
-    let skippedCount = 0
-    let refreshedCount = 0
-    let processed = 0
-    const errors: string[] = []
     try {
-      for (let index = 0; index < normalizedTokens.length; index += IMPORT_BATCH_SIZE) {
-        if (options.bulkProgress.bulkStopRequested.value) break
-        const batch = normalizedAccountPayloads.slice(index, index + IMPORT_BATCH_SIZE)
-        try {
-          const result = await accountsApi.importAccounts(
-            batch,
-            sourceType,
-            { refresh: true, returnItems: false },
-          )
-          addedCount += Number(result.added || 0)
-          skippedCount += Number(result.skipped || 0)
-          refreshedCount += Number(result.refreshed || 0)
-          errors.push(...(Array.isArray(result.errors) ? result.errors.filter(Boolean) : []))
-        } catch (error) {
-          errors.push(`${accountPayloadToken(batch[0])?.slice(0, 6) || '-'}... 等 ${batch.length} 个账号：${options.normalizeErrorMessage(error)}`)
-        } finally {
-          processed = Math.min(normalizedTokens.length, processed + batch.length)
-          options.bulkProgress.update({
-            total: normalizedTokens.length,
-            processed,
-            done: processed >= normalizedTokens.length,
-            total_quota: 0,
-          })
-        }
-      }
-
-      await options.loadData({ silentErrorToast: true })
-      const stopped = options.bulkProgress.bulkStopRequested.value && processed < normalizedTokens.length
-      options.bulkProgress.finish({
-        total: normalizedTokens.length,
-        processed,
-        total_quota: 0,
-      })
-      if (stopped) {
-        toast.warning(`${title}已停止：已处理 ${processed}/${normalizedTokens.length} 个`)
-      } else if (errors.length > 0) {
-        toast.warning(`${title}完成：新增 ${addedCount}，跳过 ${skippedCount}，刷新 ${refreshedCount}，失败 ${errors.length}`)
-      } else {
-        toast.success(`${title}完成：新增 ${addedCount}，跳过 ${skippedCount}，刷新 ${refreshedCount}`)
-      }
-      if (addedCount + skippedCount + refreshedCount > 0) {
-        manualTokenText.value = ''
-        sessionJsonText.value = ''
-      }
-      if (!stopped && errors.length > 0) {
-        await promptRemoveImportedAbnormalAccounts(normalizedTokens, errors.length)
-      }
-    } catch (error) {
-      options.bulkProgress.finish({
-        total: normalizedTokens.length,
-        processed,
-        error: options.normalizeErrorMessage(error),
-        total_quota: 0,
-      })
-      options.setError(`${title}失败`, error)
-    } finally {
-      importBusy.value = false
-      options.bulkProgress.end()
-    }
+      importJob.value = await importJobsApi.start({ accounts: rows })
+      manualTokenText.value = ''
+      sessionJsonText.value = ''
+      parsedFileRows = []
+      parsedFilePreview = ''
+      toast.success('导入任务已提交，关闭窗口或页面后仍会继续')
+      await refreshImportJobs()
+      void pollJob()
+    } catch (error) { options.setError('提交导入任务失败', error) }
+    finally { importBusy.value = false }
   }
-
-  async function importTokenBatch(tokens: string[], sourceType: string, title: string) {
-    await importAccountPayloadBatch(
-      uniqueTokens(tokens).map((accessToken) => ({
-        access_token: accessToken,
-        type: 'free',
-        source_type: sourceType,
-      })),
-      sourceType,
-      title,
-    )
-  }
-
   async function importManualTokenText() {
-    await importTokenBatch(parseTokenLines(manualTokenText.value), 'manual', '导入 Access Token')
+    try {
+      const rows = parsedFileRows.length && manualTokenText.value === parsedFilePreview
+        ? parsedFileRows : parseAccountCredentials(manualTokenText.value, importMode.value)
+      await startImport(rows)
+    } catch (error) { options.setError('识别凭据失败', error) }
   }
-
   async function importTokenTextFile(file: File | null | undefined) {
     if (!file) return
-    const text = await file.text()
-    manualTokenText.value = text
-    await importManualTokenText()
+    try {
+      parsedFileRows = parseAccountCredentials(await file.text(), importMode.value)
+      const rtOnly = parsedFileRows.every(r => !r.access_token && r.refresh_token)
+      importMode.value = rtOnly ? 'refresh_token' : 'access_token'
+      parsedFilePreview = parsedFileRows.map(r => String(rtOnly ? r.refresh_token : r.access_token || r.refresh_token)).join('\n')
+      manualTokenText.value = parsedFilePreview
+      toast.success(`已识别 ${parsedFileRows.length} 个账号，点击开始导入`)
+    } catch (error) { options.setError('读取文件失败', error) }
   }
-
   async function importSessionJson() {
-    await importAccountPayloadBatch([parseSessionJsonAccount(sessionJsonText.value)], 'session_json', '导入 Session JSON')
+    try { await startImport(parseAccountCredentials(sessionJsonText.value)) }
+    catch (error) { options.setError('识别 JSON 失败', error) }
   }
-
+  async function importLocalCPAFiles(files: FileList | File[] | null | undefined) {
+    try {
+      parsedFileRows = []
+      for (const file of Array.from(files || [])) parsedFileRows.push(...parseAccountCredentials(await file.text()))
+      const rtOnly = parsedFileRows.length > 0 && parsedFileRows.every(r => !r.access_token && r.refresh_token)
+      importMode.value = rtOnly ? 'refresh_token' : 'access_token'
+      parsedFilePreview = parsedFileRows.map(r => String(rtOnly ? r.refresh_token : r.access_token || r.refresh_token)).join('\n')
+      manualTokenText.value = parsedFilePreview
+      toast.success(`已识别 ${parsedFileRows.length} 个账号，点击开始导入`)
+    } catch (error) { options.setError('读取 JSON 文件失败', error) }
+  }
   async function startOAuthLogin() {
     importBusy.value = true
     try {
@@ -355,47 +210,12 @@ export function useAccountImportRuntime(options: AccountImportRuntimeOptions) {
     }
   }
 
-  async function importLocalCPAFiles(files: FileList | File[] | null | undefined) {
-    const fileList = Array.from(files || [])
-    if (!fileList.length) return
-    importBusy.value = true
-    try {
-      const tokens: string[] = []
-      for (const file of fileList) {
-        const text = await file.text()
-        tokens.push(...parseCPAJsonTokens(text, file.name))
-      }
-      importBusy.value = false
-      await importTokenBatch(tokens, 'cpa_json', '导入 CPA JSON 文件')
-    } catch (error) {
-      options.setError('导入 CPA JSON 文件失败', error)
-    } finally {
-      importBusy.value = false
-    }
-  }
-
   return {
-    importBusy,
-    showImportModal,
-    importMode,
-    importModeOptions,
-    oauthEmailHint,
-    oauthCallbackText,
-    oauthSessionId,
-    oauthAuthorizeUrl,
-    oauthRedirectUriPrefix,
-    manualTokenText,
-    sessionJsonText,
-    setImportMode,
-    openImportModal,
-    closeImportModal,
-    importManualTokenText,
-    importTokenTextFile,
-    importSessionJson,
-    startOAuthLogin,
-    openOAuthAuthorizeUrl,
-    copyOAuthAuthorizeUrl,
-    finishOAuthLogin,
-    importLocalCPAFiles,
+    importBusy, showImportModal, importMinimized, importMode, importModeOptions,
+    importJob, importJobs, importMonitorError, importRunning, selectImportJob, minimizeImportModal,
+    oauthEmailHint, oauthCallbackText, oauthSessionId, oauthAuthorizeUrl, oauthRedirectUriPrefix,
+    manualTokenText, sessionJsonText, setImportMode, openImportModal, closeImportModal,
+    importManualTokenText, importTokenTextFile, importSessionJson, importLocalCPAFiles,
+    startOAuthLogin, openOAuthAuthorizeUrl, copyOAuthAuthorizeUrl, finishOAuthLogin,
   }
 }

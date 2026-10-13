@@ -5,9 +5,9 @@ import (
 	"errors"
 	"net/http"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/auucoder/gptgrok2api-go/internal/provider"
@@ -33,12 +33,18 @@ func (s *Server) accountAccessTokenRefresh(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	var body struct {
-		AccessTokens []string `json:"access_tokens"`
+		AccessTokens []string          `json:"access_tokens"`
+		IDs          []string          `json:"account_ids"`
+		Selection    *accountSelection `json:"selection"`
 	}
 	if !decodeJSON(w, r, &body) {
 		return
 	}
-	refs := uniqueAccountRefs(body.AccessTokens)
+	refs, err := s.selectedOperationRefs(body.AccessTokens, body.IDs, body.Selection)
+	if err != nil {
+		writeError(w, 400, err.Error(), "invalid_request_error")
+		return
+	}
 	if len(refs) == 0 {
 		writeError(w, http.StatusBadRequest, "access_tokens is required", "invalid_request_error")
 		return
@@ -51,22 +57,17 @@ func (s *Server) accountAccessTokenRefresh(w http.ResponseWriter, r *http.Reques
 			errorsOut = append(errorsOut, map[string]any{"token": tokenPreview(ref), "error": safeRefreshError(err)})
 			continue
 		}
-		oldToken := accountToken(account)
 		ctx, cancel := context.WithTimeout(r.Context(), 90*time.Second)
-		result, refreshErr := s.openAIAccountClient().RefreshAccessToken(ctx, account)
+		_, refreshErr := s.syncCredential(ctx, account, true)
 		cancel()
 		if refreshErr != nil {
 			errorsOut = append(errorsOut, map[string]any{"token": tokenPreview(ref), "error": safeRefreshError(refreshErr)})
 			continue
 		}
-		if _, _, err = s.store.RotateAccountTokens(oldToken, result.AccessToken, result.RefreshToken, result.IDToken, result.Fields); err != nil {
-			errorsOut = append(errorsOut, map[string]any{"token": tokenPreview(ref), "error": safeRefreshError(err)})
-			continue
-		}
 		updated++
 	}
 	items, _ := s.store.AccountList()
-	writeJSON(w, http.StatusOK, map[string]any{"updated": updated, "success_count": updated, "errors": errorsOut, "items": accountsForAPI(items)})
+	writeJSON(w, http.StatusOK, map[string]any{"updated": updated, "success_count": updated, "errors": errorsOut, "items": accountsForAPI(items, s.configuredImageMinimumValidity())})
 }
 
 func (s *Server) accountRefreshStart(w http.ResponseWriter, r *http.Request) {
@@ -78,20 +79,26 @@ func (s *Server) accountRefreshStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		AccessTokens []string `json:"access_tokens"`
+		AccessTokens []string          `json:"access_tokens"`
+		IDs          []string          `json:"account_ids"`
+		Selection    *accountSelection `json:"selection"`
 	}
 	if !decodeJSON(w, r, &body) {
 		return
 	}
-	refs := uniqueAccountRefs(body.AccessTokens)
-	if len(refs) == 0 {
+	refs, err := s.selectedOperationRefs(body.AccessTokens, body.IDs, body.Selection)
+	if err != nil {
+		writeError(w, 400, err.Error(), "invalid_request_error")
+		return
+	}
+	if len(refs) == 0 && body.Selection == nil && len(body.IDs) == 0 && len(body.AccessTokens) == 0 {
 		items, err := s.store.AccountList()
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error(), "server_error")
 			return
 		}
 		for _, item := range items {
-			if ref := accountPublicRef(item); ref != "" && accountToken(item) != "" {
+			if ref := accountPublicRef(item); ref != "" {
 				refs = append(refs, ref)
 			}
 		}
@@ -102,16 +109,13 @@ func (s *Server) accountRefreshStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	progressID := newChatID()
-	s.refreshMu.Lock()
-	s.refreshProgress[progressID] = &accountRefreshProgress{
-		Total:        len(refs),
-		StatusCounts: map[string]int{"正常": 0, "限流": 0, "异常": 0, "禁用": 0},
+	progressID, err := s.createAccountRefresh(refs)
+	if err != nil {
+		writeError(w, 503, "保存同步任务失败", "storage_error")
+		return
 	}
-	s.refreshMu.Unlock()
-
-	go s.runAccountRefresh(progressID, refs)
-	writeJSON(w, http.StatusOK, map[string]any{"progress_id": progressID})
+	s.launchBackground(func() { s.runAccountRefresh(s.backgroundCtx, progressID) })
+	writeJSON(w, 200, map[string]any{"progress_id": progressID})
 }
 
 func (s *Server) accountRefreshProgressAPI(w http.ResponseWriter, r *http.Request) {
@@ -119,102 +123,35 @@ func (s *Server) accountRefreshProgressAPI(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	if r.Method != http.MethodGet {
-		writeError(w, http.StatusMethodNotAllowed, "method not allowed", "invalid_request_error")
+		writeError(w, 405, "method not allowed", "invalid_request_error")
 		return
 	}
 	id := strings.TrimPrefix(r.URL.Path, "/api/accounts/refresh/progress/")
-	if id == "" || strings.Contains(id, "/") {
-		writeError(w, http.StatusNotFound, "progress not found", "not_found")
+	id = strings.TrimPrefix(id, "/api/accounts/operations/")
+	if id == "" || strings.ContainsAny(id, "/\\") {
+		writeError(w, 404, "progress not found", "not_found")
 		return
 	}
-	s.refreshMu.RLock()
-	progress, ok := s.refreshProgress[id]
-	if ok {
-		copy := *progress
-		copy.StatusCounts = cloneIntMap(progress.StatusCounts)
-		copy.Result = cloneMap(progress.Result)
-		progress = &copy
-	}
-	s.refreshMu.RUnlock()
-	if !ok {
-		writeError(w, http.StatusNotFound, "progress not found", "not_found")
-		return
-	}
-	writeJSON(w, http.StatusOK, progress)
-}
-
-func (s *Server) runAccountRefresh(progressID string, refs []string) {
-	ctx := context.Background()
-	var wg sync.WaitGroup
-	sem := make(chan struct{}, accountRefreshConcurrency())
-	for _, ref := range refs {
-		ref := ref
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-			s.refreshOneAccount(ctx, progressID, ref)
-		}()
-	}
-	wg.Wait()
-	items, err := s.store.AccountList()
-	result := map[string]any{"refreshed": 0, "errors": []any{}, "items": accountsForAPI(items)}
+	doc, err := s.store.Document("refreshjob-" + id)
 	if err != nil {
-		s.finishAccountRefresh(progressID, nil, err.Error())
+		writeError(w, 503, "读取同步任务失败", "storage_error")
 		return
 	}
-	s.refreshMu.Lock()
-	if progress := s.refreshProgress[progressID]; progress != nil {
-		if progress.Result != nil {
-			result = progress.Result
-		}
-		result["items"] = accountsForAPI(items)
-		progress.Result = result
-		progress.Done = true
-	}
-	s.refreshMu.Unlock()
-}
-
-func (s *Server) refreshOneAccount(parent context.Context, progressID, ref string) {
-	ctx, cancel := context.WithTimeout(parent, 90*time.Second)
-	defer cancel()
-	items, err := s.store.AccountList()
-	if err != nil {
-		s.recordRefreshError(progressID, ref, err)
+	if doc["id"] == nil {
+		writeError(w, 404, "progress not found", "not_found")
 		return
 	}
-	var account map[string]any
-	for _, item := range items {
-		if accountRefMatches(item, ref) {
-			account = item
-			break
-		}
+	counts := map[string]int{"正常": 0, "限流": 0, "异常": 0, "禁用": 0}
+	for k, v := range mapValue(doc["status_counts"]) {
+		counts[k] = intValue(v)
 	}
-	if account == nil {
-		s.recordRefreshError(progressID, ref, errors.New("account not found"))
-		return
+	result := map[string]any{"refreshed": intValue(doc["success"]), "errors": doc["errors"], "failed": intValue(doc["failed"])}
+	if doc["status"] == "completed" {
+		// Keep the legacy result shape. Detailed account lists have their own paginated API.
+		result["items"] = []any{}
 	}
-	token := accountToken(account)
-	result, err := s.openAIAccountClient().RefreshAccount(ctx, account)
-	if err != nil {
-		if updates := accountRefreshFailureUpdates(err); len(updates) > 0 {
-			_, _, _ = s.store.UpdateAccount(token, updates)
-		}
-		s.recordRefreshError(progressID, ref, err)
-		return
-	}
-	updated, _, updateErr := s.store.RotateAccountTokens(token, result.AccessToken, result.RefreshToken, result.IDToken, result.Fields)
-	if updateErr != nil {
-		s.recordRefreshError(progressID, ref, updateErr)
-		return
-	}
-	if updated == nil {
-		s.recordRefreshError(progressID, ref, errors.New("account update returned empty result"))
-		return
-	}
-	s.recordRefreshSuccess(progressID)
-	s.updateRefreshStatus(progressID, updated)
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, 200, accountRefreshProgress{Total: intValue(doc["total"]), Processed: intValue(doc["processed"]), Done: doc["status"] == "completed", StatusCounts: counts, TotalQuota: intValue(doc["total_quota"]), Result: result})
 }
 
 func (s *Server) openAIAccountClient() *provider.OpenAIAccountClient {
@@ -234,37 +171,6 @@ func (s *Server) openAIAccountClient() *provider.OpenAIAccountClient {
 	)
 }
 
-func (s *Server) recordRefreshSuccess(progressID string) {
-	s.refreshMu.Lock()
-	if progress := s.refreshProgress[progressID]; progress != nil {
-		progress.Processed++
-		if progress.Result == nil {
-			progress.Result = map[string]any{"refreshed": 0, "errors": []any{}}
-		}
-		progress.Result["refreshed"] = intValue(progress.Result["refreshed"]) + 1
-	}
-	s.refreshMu.Unlock()
-}
-
-func (s *Server) recordRefreshError(progressID, ref string, err error) {
-	s.refreshMu.Lock()
-	if progress := s.refreshProgress[progressID]; progress != nil {
-		progress.Processed++
-		if progress.Result == nil {
-			progress.Result = map[string]any{}
-		}
-		errorsValue, _ := progress.Result["errors"].([]any)
-		errorsValue = append(errorsValue, map[string]any{"token": tokenPreview(ref), "error": safeRefreshError(err)})
-		progress.Result["errors"] = errorsValue
-	}
-	s.refreshMu.Unlock()
-	// Update status counts from the persisted account after the error marker is
-	// written, so progress reflects what the next account selection sees.
-	if account, lookupErr := s.accountByRef(ref); lookupErr == nil {
-		s.updateRefreshStatus(progressID, account)
-	}
-}
-
 func accountRefreshConcurrency() int {
 	value, err := strconv.Atoi(strings.TrimSpace(os.Getenv("GO_ACCOUNT_REFRESH_CONCURRENCY")))
 	if err != nil || value < 1 {
@@ -276,32 +182,13 @@ func accountRefreshConcurrency() int {
 	return value
 }
 
-func (s *Server) updateRefreshStatus(progressID string, account map[string]any) {
-	category := accountStatusCategory(account)
-	label := map[string]string{"normal": "正常", "limited": "限流", "abnormal": "异常", "disabled": "禁用"}[category]
-	if label == "" {
-		label = "异常"
-	}
-	s.refreshMu.Lock()
-	if progress := s.refreshProgress[progressID]; progress != nil {
-		progress.StatusCounts[label]++
-		progress.TotalQuota += intValue(account["quota"])
-	}
-	s.refreshMu.Unlock()
-}
-
-func (s *Server) finishAccountRefresh(progressID string, result map[string]any, message string) {
-	s.refreshMu.Lock()
-	defer s.refreshMu.Unlock()
-	if progress := s.refreshProgress[progressID]; progress != nil {
-		progress.Done = true
-		progress.Error = message
-		progress.Result = result
-	}
-}
-
 func (s *Server) accountByRef(ref string) (map[string]any, error) {
-	items, err := s.store.AccountList()
+	if item, err := s.store.FindAccount(ref); err == nil {
+		return item, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	items, _, err := s.store.AccountSnapshot()
 	if err != nil {
 		return nil, err
 	}
@@ -310,7 +197,7 @@ func (s *Server) accountByRef(ref string) (map[string]any, error) {
 			return item, nil
 		}
 	}
-	return nil, errors.New("account not found")
+	return nil, os.ErrNotExist
 }
 
 func accountRefreshFailureUpdates(err error) map[string]any {
@@ -372,8 +259,11 @@ func safeRefreshError(err error) string {
 		return ""
 	}
 	message := strings.TrimSpace(err.Error())
+	message = credentialErrorPattern.ReplaceAllString(message, "[redacted]")
 	if len(message) > 300 {
 		message = message[:300]
 	}
 	return message
 }
+
+var credentialErrorPattern = regexp.MustCompile(`(?i)(?:Bearer\s+[^\s"',;]+|eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+|rt\.[A-Za-z0-9._-]+|(?:access_token|refresh_token|id_token|client_secret)\s*[=:]\s*"?[^\s",;}]+)`)

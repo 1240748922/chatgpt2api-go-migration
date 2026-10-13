@@ -38,6 +38,7 @@
         <button class="overlay-btn" title="下载" @click.stop="handleDownload">
           <Icon icon="lucide:download" />
         </button>
+        <button v-if="file.genbox_enabled" class="overlay-btn" title="推送至 GenBox" @click.stop="emit('push', file)"><Icon icon="lucide:send" /></button>
         <button class="overlay-btn danger" title="删除" @click.stop="handleDelete">
           <Icon icon="lucide:trash-2" />
         </button>
@@ -64,6 +65,7 @@
         <span :title="file.call_id">请求 {{ file.call_id.slice(0, 12) }}</span>
         <span v-if="file.endpoint">{{ file.endpoint }}</span>
       </div>
+      <div v-if="file.genbox_push" class="file-meta"><span>{{ file.genbox_push.label }}</span></div>
       <div v-if="file.tags.length" class="tag-row">
         <button
           v-for="tag in file.tags"
@@ -104,6 +106,7 @@ const emit = defineEmits<{
   (e: 'copy', file: GalleryFile): void
   (e: 'edit-tags', file: GalleryFile): void
   (e: 'download', file: GalleryFile): void
+  (e: 'push', file: GalleryFile): void
   (e: 'delete', file: GalleryFile): void
   (e: 'tag-click', tag: string): void
 }>()

@@ -17,6 +17,7 @@ import (
 
 	"github.com/auucoder/gptgrok2api-go/internal/accounts"
 	"github.com/auucoder/gptgrok2api-go/internal/config"
+	"github.com/auucoder/gptgrok2api-go/internal/store"
 )
 
 func adminTestConfig(root string) config.Config {
@@ -149,7 +150,7 @@ func TestMonitorSnapshotWithHistorySummary(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	server := &Server{cfg: cfg, monitor: newRuntimeMonitor()}
+	server := &Server{cfg: cfg, monitor: newRuntimeMonitor(), store: store.New(cfg.AccountsPath, cfg.AuthKeysPath, cfg.ConfigPath)}
 	server.monitor.start("call-1", "/v1/chat/completions", "gpt-4o", "hello")
 	server.monitor.update("call-1", "running", 35, "")
 
@@ -240,6 +241,7 @@ func TestDashboardAccountAndLogSummary(t *testing.T) {
 
 func TestDashboardRouteDisablesCaching(t *testing.T) {
 	server := New(adminTestConfig(t.TempDir()))
+	t.Cleanup(func() { _ = server.Close() })
 	response := adminRequest(server.Handler(), http.MethodGet, "/api/dashboard?time_range=24h", nil)
 	if response.Code != http.StatusOK {
 		t.Fatalf("unexpected dashboard status: %d %s", response.Code, response.Body.String())
@@ -259,7 +261,7 @@ func TestDashboardRouteDisablesCaching(t *testing.T) {
 func TestRequestMonitorWritesMultipartCallLog(t *testing.T) {
 	root := t.TempDir()
 	cfg := adminTestConfig(root)
-	server := &Server{cfg: cfg, monitor: newRuntimeMonitor()}
+	server := &Server{cfg: cfg, monitor: newRuntimeMonitor(), store: store.New(cfg.AccountsPath, cfg.AuthKeysPath, cfg.ConfigPath)}
 
 	var body bytes.Buffer
 	writer := multipart.NewWriter(&body)
@@ -369,7 +371,9 @@ func TestAdminImagesTagsAndBackup(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(cfg.ImageDataDir, "image-one.png"), []byte("png"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	handler := New(cfg).Handler()
+	handlerServer := New(cfg)
+	t.Cleanup(func() { _ = handlerServer.Close() })
+	handler := handlerServer.Handler()
 
 	list := adminRequest(handler, http.MethodGet, "/api/images", nil)
 	if list.Code != http.StatusOK || !strings.Contains(list.Body.String(), "image-one.png") {
@@ -425,7 +429,9 @@ func TestRegistrationManagementEndpoints(t *testing.T) {
 	if err := os.WriteFile(cfg.GrokAccountsPath, []byte(account), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	handler := New(cfg).Handler()
+	handlerServer := New(cfg)
+	t.Cleanup(func() { _ = handlerServer.Close() })
+	handler := handlerServer.Handler()
 
 	unauthorized := httptest.NewRecorder()
 	handler.ServeHTTP(unauthorized, httptest.NewRequest(http.MethodGet, "/api/register", nil))
@@ -484,7 +490,9 @@ func TestImportedAbnormalAccountCleanup(t *testing.T) {
 	if err := os.WriteFile(cfg.AccountsPath, []byte(accounts), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	handler := New(cfg).Handler()
+	handlerServer := New(cfg)
+	t.Cleanup(func() { _ = handlerServer.Close() })
+	handler := handlerServer.Handler()
 
 	preview := adminRequest(handler, http.MethodPost, "/api/accounts/import-cleanup", strings.NewReader(`{"access_tokens":["abnormal-token","normal-token","abnormal-token"],"remove":false}`))
 	if preview.Code != http.StatusOK || !strings.Contains(preview.Body.String(), `"checked":2`) || !strings.Contains(preview.Body.String(), `"abnormal":1`) || !strings.Contains(preview.Body.String(), `"removed":0`) {

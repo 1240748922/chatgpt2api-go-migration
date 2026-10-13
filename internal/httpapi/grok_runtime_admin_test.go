@@ -30,7 +30,9 @@ func TestGrokRuntimeAdminMasksTokensAndSupportsOpaqueSelectors(t *testing.T) {
 	if err := os.WriteFile(cfg.AccountsPath, raw, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	handler := New(cfg).Handler()
+	handlerServer := New(cfg)
+	t.Cleanup(func() { _ = handlerServer.Close() })
+	handler := handlerServer.Handler()
 
 	listed := adminRequest(handler, http.MethodGet, "/api/grok/runtime/admin/tokens", nil)
 	if listed.Code != http.StatusOK {
@@ -69,7 +71,9 @@ func TestGrokRuntimeAdminMasksTokensAndSupportsOpaqueSelectors(t *testing.T) {
 
 func TestGrokRuntimeAdminRefreshReportsNotConfigured(t *testing.T) {
 	root := t.TempDir()
-	handler := New(adminTestConfig(root)).Handler()
+	handlerServer := New(adminTestConfig(root))
+	t.Cleanup(func() { _ = handlerServer.Close() })
+	handler := handlerServer.Handler()
 
 	empty := adminRequest(handler, http.MethodPost, "/api/grok/runtime/admin/batch/refresh", strings.NewReader(`{"tokens":[]}`))
 	if empty.Code != http.StatusBadRequest {

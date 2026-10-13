@@ -1,4 +1,4 @@
-FROM node:22-alpine AS web-build
+FROM node:24-alpine AS web-build
 
 WORKDIR /src/web-vue
 COPY web-vue/package.json web-vue/package-lock.json ./
@@ -10,7 +10,7 @@ COPY web-vue ./
 COPY web-vue/tsconfig.json /src/web-vue/tsconfig.json
 RUN npm run build
 
-FROM golang:1.23-alpine AS go-build
+FROM golang:1.25-alpine AS go-build
 WORKDIR /src
 COPY go.mod ./
 COPY go.sum ./
@@ -18,14 +18,14 @@ COPY cmd ./cmd
 COPY internal ./internal
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /gptgrok2api ./cmd/gptgrok2api
 
-FROM alpine:3.21
-RUN adduser -D -H -u 10001 app
+FROM alpine:3.22 AS app-runtime
+RUN apk add --no-cache ca-certificates tzdata && adduser -D -H -u 10001 app
 WORKDIR /app
 COPY --from=go-build /gptgrok2api /app/gptgrok2api
 COPY --from=web-build /src/web-vue/dist /app/web_dist
 COPY VERSION CHANGELOG.md config.example.yaml ./
 COPY services/default_prompt_library.json /app/services/default_prompt_library.json
-RUN mkdir -p /app/data && chown -R app:app /app
+RUN mkdir -p /app/data /app/logs && chown -R app:app /app
 USER app
 ENV GO_LISTEN_ADDR=:80 \
     GO_STATIC_DIR=/app/web_dist \
@@ -35,3 +35,36 @@ ENV GO_LISTEN_ADDR=:80 \
     GO_QUEUE_BACKEND=json
 EXPOSE 80
 ENTRYPOINT ["/app/gptgrok2api"]
+
+FROM node:24-bookworm-slim AS registrar-node
+FROM python:3.12-slim-bookworm AS registrar
+COPY --from=registrar-node /usr/local/bin/node /usr/local/bin/node
+ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 \
+    PLAYWRIGHT_BROWSERS_PATH=/opt/browsers XDG_CACHE_HOME=/opt/cache CLOAKBROWSER_CACHE_DIR=/opt/cache/cloakbrowser
+WORKDIR /app
+COPY registration-tool/requirements.txt /tmp/registration-requirements.txt
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates tzdata curl \
+    && pip install --no-cache-dir -r /tmp/registration-requirements.txt \
+    && python -m playwright install --with-deps chromium firefox \
+    && python -m camoufox fetch \
+    && python -c "from cloakbrowser import ensure_binary; ensure_binary()" \
+    && rm -rf /var/lib/apt/lists/* /tmp/registration-requirements.txt \
+    && useradd --uid 10001 --create-home app \
+    && chown -R app:app /opt/browsers /opt/cache
+COPY --from=go-build /gptgrok2api /app/gptgrok2api
+COPY --from=web-build /src/web-vue/dist /app/web_dist
+COPY VERSION CHANGELOG.md config.example.yaml ./
+COPY services/default_prompt_library.json /app/services/default_prompt_library.json
+COPY registration-tool /app/registration-tool
+RUN mkdir -p /app/data /app/logs && chown -R app:app /app
+USER app
+ENV GO_LISTEN_ADDR=:80 GO_STATIC_DIR=/app/web_dist \
+    GO_CONFIG_PATH=/app/data/config.json GO_AUTH_KEYS_PATH=/app/data/auth_keys.json \
+    GROK_DATA_DIR=/app/data GO_QUEUE_BACKEND=json \
+    GO_REGISTRATION_WORKER=true GO_REGISTRATION_TOOL_DIR=/app/registration-tool \
+    GO_REGISTRATION_PYTHON=python3
+EXPOSE 80
+ENTRYPOINT ["/app/gptgrok2api"]
+
+# Preserve the lightweight application as the default build target.
+FROM app-runtime AS final

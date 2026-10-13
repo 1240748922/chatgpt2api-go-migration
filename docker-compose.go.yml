@@ -1,97 +1,140 @@
-services:
-  redis:
-    image: redis:7-alpine
-    container_name: gptgrok2api-go-redis
-    restart: unless-stopped
-    command: ["redis-server", "--appendonly", "yes"]
-    volumes:
-      - ./data/redis:/data
+name: chatgpt-images-go
 
-  app:
+x-app: &app
+  image: ${CHATGPT_GO_IMAGE:-chatgpt-images-go:local}
+  build:
+    context: .
+    dockerfile: Dockerfile.golang
+    target: app-runtime
+  restart: unless-stopped
+  init: true
+  stop_grace_period: 30s
+  depends_on:
+    postgres:
+      condition: service_healthy
+    volume-init:
+      condition: service_completed_successfully
+  volumes:
+    - go-data:/app/data
+    - go-logs:/app/logs
+  environment: &app-env
+    GO_DATABASE_URL: postgres://chatgpt:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env.go}@postgres:5432/chatgpt?sslmode=disable
+    CHATGPT2API_AUTH_KEY: ${CHATGPT2API_AUTH_KEY:?set API key in .env.go}
+    CHATGPT2API_ADMIN_KEY: ${CHATGPT2API_ADMIN_KEY:?set admin key in .env.go}
+    GO_OAUTH_ENCRYPTION_KEY: ${GO_OAUTH_ENCRYPTION_KEY:?set a stable encryption key in .env.go}
+    GO_LISTEN_ADDR: :80
+    GO_CONFIG_PATH: /app/data/config.json
+    GO_ACCOUNTS_PATH: /app/data/accounts.json
+    GO_AUTH_KEYS_PATH: /app/data/auth_keys.json
+    GROK_DATA_DIR: /app/data
+    GO_QUEUE_BACKEND: json
+    GO_PUBLIC_BASE_URL: ${GO_PUBLIC_BASE_URL:-}
+    GO_IMAGE_ACCOUNT_CONCURRENCY: ${GO_IMAGE_ACCOUNT_CONCURRENCY:-1}
+    GO_IMAGE_MAX_CONCURRENCY: ${GO_IMAGE_MAX_CONCURRENCY:-128}
+    GO_REQUEST_TIMEOUT_SECONDS: ${GO_REQUEST_TIMEOUT_SECONDS:-180}
+    GO_DATABASE_MAX_CONNECTIONS: ${GO_DATABASE_MAX_CONNECTIONS:-8}
+    GO_REGISTRATION_WORKER: "false"
+    GO_IMAGE_PROCESSOR_URL: http://image-processor:8080
+    TZ: ${TZ:-Asia/Shanghai}
+  healthcheck:
+    test: [CMD, wget, -qO-, http://127.0.0.1/health]
+    interval: 10s
+    timeout: 5s
+    retries: 5
+    start_period: 30s
+
+services:
+  image-processor:
+    image: ${CHATGPT_GO_PROCESSOR_IMAGE:-chatgpt-images-go-processor:local}
+    build:
+      context: .
+      dockerfile: image-processor/Dockerfile
+    restart: unless-stopped
+    init: true
+    mem_limit: 1g
+    environment:
+      IMAGE_PROCESSOR_CONCURRENCY: ${IMAGE_PROCESSOR_CONCURRENCY:-2}
+  volume-init:
+    image: busybox:1.37
+    user: "0:0"
+    restart: "no"
+    command: [sh, -c, "mkdir -p /data/files /data/registration /logs && chown -R 10001:10001 /data /logs"]
+    volumes:
+      - go-data:/data
+      - go-logs:/logs
+  postgres:
+    image: postgres:17
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: chatgpt
+      POSTGRES_DB: chatgpt
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env.go}
+      TZ: ${TZ:-Asia/Shanghai}
+    volumes:
+      - go-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U chatgpt -d chatgpt"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+  app0: *app
+  app1: *app
+  app2: *app
+  app3: *app
+  app4: *app
+  app5: *app
+  app6: *app
+  app7: *app
+  registrar:
+    <<: *app
+    image: ${CHATGPT_GO_REGISTRAR_IMAGE:-chatgpt-images-go-registrar:local}
     build:
       context: .
       dockerfile: Dockerfile.golang
-    image: ${CHATGPT2API_GO_IMAGE:-gptgrok2api-go:local}
-    container_name: gptgrok2api-go
-    restart: unless-stopped
-    ports:
-      - "${CHATGPT2API_GO_PORT:-3000}:80"
-    volumes:
-      - ./data:/app/data
-      - ./logs:/app/logs
+      target: registrar
     environment:
-      CHATGPT2API_AUTH_KEY: ${CHATGPT2API_AUTH_KEY:-}
-      CHATGPT2API_ADMIN_KEY: ${CHATGPT2API_ADMIN_KEY:-}
-      GO_CONFIG_PATH: ${GO_CONFIG_PATH:-/app/data/config.json}
-      GO_UPSTREAM_URL: ${GO_UPSTREAM_URL:-}
-      GO_UPSTREAM_API_KEY: ${GO_UPSTREAM_API_KEY:-}
-      GO_PUBLIC_BASE_URL: ${GO_PUBLIC_BASE_URL:-}
-      GO_QUEUE_BACKEND: ${GO_QUEUE_BACKEND:-redis}
-      GO_REDIS_ADDR: ${GO_REDIS_ADDR:-redis:6379}
-      TZ: ${TZ:-Asia/Shanghai}
-    networks:
-      default:
-      upstream:
-        aliases:
-          - gptgrok2api-go
-
-  image-queue-redis:
-    image: redis:7.4-alpine
-    container_name: chatgpt2api-image-queue-redis
-    restart: unless-stopped
-    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec", "--maxmemory", "2gb", "--maxmemory-policy", "noeviction"]
-    volumes:
-      - ./data/go-image-redis:/data
+      <<: *app-env
+      GO_REGISTRATION_WORKER: "true"
+      GO_REGISTRATION_TOOL_DIR: /app/registration-tool
+      GO_REGISTRATION_RUNTIME_DIR: /app/data/registration
+    shm_size: 1gb
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
-      timeout: 3s
-      retries: 10
-
-  image-gateway:
-    build:
-      context: ./go-image-gateway
-    image: chatgpt2api/go-image-gateway:local
-    container_name: chatgpt2api-image-gateway
+      test: [CMD, curl, --fail, --max-time, "5", http://127.0.0.1/health]
+      interval: 10s
+      timeout: 6s
+      retries: 5
+      start_period: 30s
+  gateway:
+    image: nginx:1.29-alpine
     restart: unless-stopped
     depends_on:
-      image-queue-redis:
+      app0:
         condition: service_healthy
-      app:
-        condition: service_started
-    environment:
-      IMAGE_GATEWAY_REDIS_ADDR: image-queue-redis:6379
-      IMAGE_GATEWAY_BACKEND_URL: http://app/v1/images/generations
-      IMAGE_GATEWAY_SCHEDULER_URL: http://app/internal/image-scheduler
-      IMAGE_GATEWAY_MONITOR_URL: http://app/internal/image-monitor
-      IMAGE_GATEWAY_LOG_URL: http://app/internal/logs/call
-      IMAGE_GATEWAY_SCHEDULER_KEY: ${IMAGE_SCHEDULER_INTERNAL_KEY:-}
-      IMAGE_GATEWAY_AUTH_KEYS_FILE: /etc/image-gateway/auth_keys.json
-      IMAGE_GATEWAY_AUTH_KEY: ${CHATGPT2API_AUTH_KEY:-}
-      # Defaults sized for a small host; raise workers for higher throughput.
-      IMAGE_GATEWAY_WORKERS: ${IMAGE_GATEWAY_WORKERS:-8}
-      IMAGE_GATEWAY_QUEUE_CAPACITY: ${IMAGE_GATEWAY_QUEUE_CAPACITY:-1000}
-      IMAGE_GATEWAY_BACKEND_TIMEOUT_SECS: ${IMAGE_GATEWAY_BACKEND_TIMEOUT_SECS:-900}
-      IMAGE_GATEWAY_TASK_TTL_SECS: ${IMAGE_GATEWAY_TASK_TTL_SECS:-86400}
-      IMAGE_GATEWAY_MAX_ATTEMPTS: ${IMAGE_GATEWAY_MAX_ATTEMPTS:-1}
-      # 25 MiB accepts typical image requests while limiting memory pressure.
-      IMAGE_GATEWAY_MAX_BODY_MB: ${IMAGE_GATEWAY_MAX_BODY_MB:-25}
+      app1:
+        condition: service_healthy
+      app2:
+        condition: service_healthy
+      app3:
+        condition: service_healthy
+      app4:
+        condition: service_healthy
+      app5:
+        condition: service_healthy
+      app6:
+        condition: service_healthy
+      app7:
+        condition: service_healthy
     ports:
-      - "127.0.0.1:${IMAGE_GATEWAY_PORT:-3001}:8080"
+      - "${CHATGPT_GO_PORT:-31001}:80"
     volumes:
-      - ./data/auth_keys.json:/etc/image-gateway/auth_keys.json:ro
-    networks:
-      default:
-        aliases:
-          - image-gateway
+      - ./deploy/go-nginx.conf:/etc/nginx/nginx.conf:ro
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/health"]
+      test: [CMD, wget, -qO-, http://127.0.0.1/health]
       interval: 10s
-      timeout: 3s
+      timeout: 5s
       retries: 5
 
-networks:
-  upstream:
-    external: true
-    name: gptgrok2api_default
-
+volumes:
+  go-data:
+  go-logs:
+  go-postgres:

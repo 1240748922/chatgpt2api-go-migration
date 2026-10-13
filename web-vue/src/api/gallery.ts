@@ -26,6 +26,8 @@ export interface GalleryFile {
   endpoint?: string
   model?: string
   generated_at?: string
+  genbox_enabled?: boolean
+  genbox_push?: { status: string; label: string; updated_at?: string }
 }
 
 export interface GalleryResponse {
@@ -238,6 +240,8 @@ function mapFile(item: BackendImageItem, retentionDays: number): GalleryFile {
     endpoint: cleanString(item.endpoint),
     model: cleanString(item.model),
     generated_at: cleanString(item.generated_at || createdAt),
+    genbox_enabled: Boolean(item.genbox_enabled),
+    genbox_push: item.genbox_push,
   }
 }
 
@@ -439,3 +443,5 @@ export const galleryApi = {
     }
   },
 }
+
+export async function pushGalleryToGenbox(path: string) { return (await apiClient.post('/images/genbox-push', { path }, { timeout: 130000 })).data }

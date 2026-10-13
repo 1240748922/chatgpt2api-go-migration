@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/auucoder/gptgrok2api-go/internal/accounts"
 	"github.com/auucoder/gptgrok2api-go/internal/protocol"
+	proxyruntime "github.com/auucoder/gptgrok2api-go/internal/proxy"
 )
 
 const (
@@ -61,7 +63,45 @@ type editableArtifact struct {
 	MessageID    string
 }
 
-func (o *OpenAIImage) ExportEditable(ctx context.Context, account accounts.Account, kind, userPrompt string, inputs []OpenAIImageInput) (EditableExportResult, error) {
+func (o *OpenAIImage) editableContext(ctx context.Context, account accounts.Account) (context.Context, func(error), error) {
+	var egress *proxyruntime.Lease
+	if o.Proxy != nil {
+		var err error
+		egress, err = o.Proxy.AcquireImageContext(ctx, account.Fields)
+		if err != nil {
+			return ctx, nil, err
+		}
+		if egress.Source == "unavailable" {
+			return ctx, nil, fmt.Errorf("editable egress unavailable")
+		}
+		ctx = proxyruntime.WithURL(ctx, egress.URL)
+		ctx = proxyruntime.WithImageLease(ctx, egress)
+	}
+	release := func() {}
+	if browserEligible(o.BaseURL) {
+		bound, done, err := o.browserPool.bind(ctx, warmKey(account, proxyruntime.URLFromContext(ctx)), proxyruntime.URLFromContext(ctx), 10*time.Minute)
+		if err != nil {
+			if egress != nil {
+				egress.Release(false)
+			}
+			return ctx, nil, err
+		}
+		ctx, release = bound, done
+	}
+	return ctx, func(err error) {
+		release()
+		if egress != nil {
+			egress.Release(openAIImageProxyFailure(err))
+		}
+	}, nil
+}
+
+func (o *OpenAIImage) ExportEditable(ctx context.Context, account accounts.Account, kind, userPrompt string, inputs []OpenAIImageInput) (result EditableExportResult, err error) {
+	ctx, release, err := o.editableContext(ctx, account)
+	if err != nil {
+		return result, err
+	}
+	defer func() { release(err) }()
 	kind = strings.ToLower(strings.TrimSpace(kind))
 	if kind != "ppt" && kind != "psd" {
 		return EditableExportResult{}, fmt.Errorf("editable export kind must be ppt or psd")
@@ -96,6 +136,23 @@ func (o *OpenAIImage) ExportEditable(ctx context.Context, account accounts.Accou
 	if err != nil {
 		return EditableExportResult{}, err
 	}
+	return o.fetchEditableResult(ctx, account, conversationID, kind)
+}
+
+// ResumeEditable only fetches the existing conversation; it never submits a prompt.
+func (o *OpenAIImage) ResumeEditable(ctx context.Context, account accounts.Account, conversationID, kind string) (result EditableExportResult, err error) {
+	if conversationID == "" || (kind != "ppt" && kind != "psd") {
+		return result, fmt.Errorf("invalid editable recovery")
+	}
+	ctx, release, err := o.editableContext(ctx, account)
+	if err != nil {
+		return result, err
+	}
+	defer func() { release(err) }()
+	return o.fetchEditableResult(ctx, account, conversationID, kind)
+}
+
+func (o *OpenAIImage) fetchEditableResult(ctx context.Context, account accounts.Account, conversationID, kind string) (EditableExportResult, error) {
 	artifacts, err := o.pollEditableArtifacts(ctx, account, conversationID, kind)
 	if err != nil {
 		return EditableExportResult{}, err
@@ -175,6 +232,9 @@ func (o *OpenAIImage) startEditable(ctx context.Context, account accounts.Accoun
 	headers := o.requirementHeaders(requirements)
 	headers["X-Conduit-Token"] = conduit
 	headers["Accept"] = "text/event-stream"
+	if err := imageCheckpoint(ctx, ImageCheckpoint{Stage: "submitting", Account: account}); err != nil {
+		return "", err
+	}
 	response, err := o.do(ctx, http.MethodPost, "/backend-api/f/conversation", account, payload, headers, true)
 	if err != nil {
 		return "", err
@@ -195,9 +255,14 @@ func (o *OpenAIImage) startEditable(ctx context.Context, account accounts.Accoun
 		var value any
 		if json.Unmarshal([]byte(data), &value) == nil && conversationID == "" {
 			conversationID = nestedString(value, "conversation_id")
+			if conversationID != "" {
+				if err := imageCheckpoint(ctx, ImageCheckpoint{Stage: "submitted", Account: account, ConversationID: conversationID}); err != nil {
+					return conversationID, err
+				}
+			}
 		}
 	}
-	if err := scanner.Err(); err != nil {
+	if err := scanner.Err(); err != nil && conversationID == "" {
 		return "", err
 	}
 	if conversationID == "" {
@@ -223,6 +288,13 @@ func (o *OpenAIImage) pollEditableArtifacts(ctx context.Context, account account
 				primary, archive := pickEditableArtifacts(artifacts, kind)
 				if primary != nil && archive != nil {
 					return artifacts, nil
+				}
+			} else {
+				var upstream *protocol.UpstreamError
+				// Invalid success JSON and definitive 4xx errors are not a
+				// pending artifact. Keep the conversation for explicit recovery.
+				if !errors.As(decodeErr, &upstream) || !isRetryableOpenAIError(decodeErr) {
+					return nil, decodeErr
 				}
 			}
 		} else if !isRetryableOpenAIError(err) {
@@ -358,7 +430,7 @@ func (o *OpenAIImage) downloadEditableArtifact(ctx context.Context, account acco
 func (o *OpenAIImage) editableResponseFile(ctx context.Context, account accounts.Account, response *http.Response, artifact editableArtifact, kind string) (EditableExportFile, error) {
 	defer response.Body.Close()
 	contentType := cleanMIME(response.Header.Get("Content-Type"))
-	raw, err := io.ReadAll(io.LimitReader(response.Body, 512<<20))
+	raw, err := readEditableArtifact(response.Body)
 	if err != nil {
 		return EditableExportFile{}, err
 	}
@@ -377,7 +449,7 @@ func (o *OpenAIImage) editableResponseFile(ctx context.Context, account accounts
 				}
 				defer response.Body.Close()
 				contentType = cleanMIME(response.Header.Get("Content-Type"))
-				raw, err = io.ReadAll(io.LimitReader(response.Body, 512<<20))
+				raw, err = readEditableArtifact(response.Body)
 				if err != nil {
 					return EditableExportFile{}, err
 				}
@@ -489,6 +561,9 @@ func decodeEditableInput(raw string, index int) (OpenAIImageInput, error) {
 		value = value[comma+1:]
 		mimeType = strings.TrimSuffix(strings.Split(header, ";")[0], ";base64")
 	}
+	if base64.StdEncoding.DecodedLen(len(value)) > (20<<20)+2 {
+		return OpenAIImageInput{}, fmt.Errorf("image %d exceeds 20 MiB", index)
+	}
 	data, err := base64.StdEncoding.DecodeString(value)
 	if err != nil {
 		return OpenAIImageInput{}, fmt.Errorf("decode image %d: %w", index, err)
@@ -516,3 +591,11 @@ func DecodeEditableInputs(values []string) ([]OpenAIImageInput, error) {
 }
 
 var _ = bytes.MinRead
+
+func readEditableArtifact(body io.Reader) ([]byte, error) {
+	raw, err := io.ReadAll(io.LimitReader(body, (64<<20)+1))
+	if err == nil && len(raw) > 64<<20 {
+		err = fmt.Errorf("editable artifact exceeds 64 MiB")
+	}
+	return raw, err
+}

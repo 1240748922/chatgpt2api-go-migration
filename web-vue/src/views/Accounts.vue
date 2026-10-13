@@ -843,10 +843,12 @@
             </div>
     </ModalShell>
 
-    <ModalShell :open="activeAccountPlatform === 'gpt' && showImportModal" max-width="58rem" :z-index="120">
-            <ModalHeader title="导入账号" :close-disabled="importModalBusy" compact @close="closeImportModal" />
+    <ModalShell :open="activeAccountPlatform === 'gpt' && showImportModal" max-width="58rem" :z-index="120" panel-class="import-panel">
+            <ModalHeader title="导入账号" compact @close="closeImportModal">
+              <template #actions><button type="button" class="p-2 text-muted-foreground hover:text-foreground" title="最小化" aria-label="最小化导入窗口" @click="minimizeImportModal"><Icon icon="lucide:minus" class="h-4 w-4" /></button></template>
+            </ModalHeader>
 
-            <div class="grid grid-cols-1 gap-0 md:grid-cols-[15rem_1fr]">
+            <div class="import-content grid grid-cols-1 gap-0 md:grid-cols-[15rem_1fr]">
               <div class="border-b border-border bg-muted/20 p-3 md:border-b-0 md:border-r">
                 <div class="space-y-1">
                   <button
@@ -863,7 +865,7 @@
                 </div>
               </div>
 
-              <div class="min-h-[26rem] p-4">
+              <div class="min-w-0 overflow-y-auto p-4">
                 <div v-if="importMode === 'oauth_login'" class="space-y-3">
                   <ImportModePanel
                     title="OAuth 登录已有账号（带自动刷新）"
@@ -923,10 +925,10 @@
                   </div>
                 </div>
 
-                <div v-else-if="importMode === 'access_token'" class="space-y-3">
+                <div v-else-if="importMode === 'access_token' || importMode === 'refresh_token'" class="space-y-3">
                   <ImportModePanel
-                    title="导入 Access Token"
-                    description="支持直接粘贴，一行一个；也支持从 TXT 文件读取，一行一个。"
+                    :title="importMode === 'refresh_token' ? '导入 Refresh Token' : '导入 AT / JSON'"
+                    description="读取 TXT 或 JSON 文件后自动提取凭据；点击开始导入才执行。"
                   />
                   <textarea
                     v-model.trim="manualTokenText"
@@ -936,9 +938,9 @@
                   ></textarea>
                   <div class="flex flex-wrap justify-end gap-2">
                     <Button size="xs" variant="outline" :disabled="importBusy" @click="openManualTokenFile">
-                      读取 TXT 文件
+                      读取 TXT / JSON
                     </Button>
-                    <Button size="xs" variant="primary" :disabled="importBusy || !manualTokenText.trim()" @click="importManualTokenText">
+                    <Button size="xs" variant="primary" :disabled="importBusy || importRunning || !manualTokenText.trim()" @click="importManualTokenText">
                       {{ importBusy ? '导入中...' : '开始导入' }}
                     </Button>
                   </div>
@@ -951,7 +953,7 @@
                   />
                   <textarea v-model.trim="sessionJsonText" rows="12" class="ui-textarea-sm font-mono" placeholder="粘贴完整 session JSON"></textarea>
                   <div class="flex justify-end">
-                    <Button size="xs" variant="primary" :disabled="importBusy || !sessionJsonText.trim()" @click="importSessionJson">
+                    <Button size="xs" variant="primary" :disabled="importBusy || importRunning || !sessionJsonText.trim()" @click="importSessionJson">
                       {{ importBusy ? '导入中...' : '开始导入' }}
                     </Button>
                   </div>
@@ -984,10 +986,14 @@
                     @imported="handleRemoteImportDone"
                   />
                 </div>
+                <ImportJobProgress :job="importJob" :jobs="importJobs" :error="importMonitorError" @select="selectImportJob" />
               </div>
             </div>
     </ModalShell>
 
+    <button v-if="importMinimized || (importRunning && !showImportModal)" type="button" class="fixed bottom-5 right-5 z-[115] flex items-center gap-2 rounded-xl border border-border bg-card px-4 py-3 text-sm shadow-lg" @click="openImportModal(importMode)">
+      <Icon icon="lucide:upload" class="h-4 w-4 text-primary" />账号导入 <span v-if="importJob" class="text-muted-foreground">{{ importJob.sync_processed }}/{{ importJob.sync_total }}</span><Icon icon="lucide:maximize-2" class="h-4 w-4" />
+    </button>
     <ModalShell :open="activeAccountPlatform === 'gpt' && showRefreshProgress" max-width="34rem" :z-index="140">
           <ModalHeader
             :title="refreshProgressTitle || '刷新账号信息和额度'"
@@ -1021,12 +1027,13 @@
           </div>
     </ModalShell>
 
-    <input ref="manualTokenFileInputRef" type="file" accept=".txt,text/plain" class="hidden" @change="handleManualTokenFileChange" />
+    <input ref="manualTokenFileInputRef" type="file" accept=".txt,.json,.jsonl,text/plain,application/json" class="hidden" @change="handleManualTokenFileChange" />
     <input ref="cpaFileInputRef" type="file" accept=".json,application/json" multiple class="hidden" @change="handleCPAFileChange" />
   </div>
 </template>
 
 <script setup lang="ts">
+import ImportJobProgress from '@/components/ImportJobProgress.vue'
 import { computed, defineAsyncComponent, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { Icon } from '@iconify/vue'
@@ -1147,6 +1154,7 @@ const {
   resettingAccountId,
   importBusy,
   exportBusy,
+  importMinimized, importJob, importJobs, importMonitorError, importRunning, selectImportJob, minimizeImportModal,
   showImportModal,
   importMode,
   importModeOptions,
@@ -1747,4 +1755,10 @@ function handleRemoteImportDone() {
     justify-content: flex-start;
   }
 }
+</style>
+
+<style>
+.import-panel { display: flex; flex-direction: column; max-height: calc(100dvh - 32px); overflow: hidden; }
+.import-content { min-height: 0; overflow-y: auto; }
+@media (min-width: 768px) { .import-content { overflow: hidden; } }
 </style>

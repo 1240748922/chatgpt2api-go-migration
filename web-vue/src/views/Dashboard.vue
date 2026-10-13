@@ -38,6 +38,8 @@
       />
     </section>
 
+    <AccountAvailabilityCard v-if="availability" :value="availability" />
+
     <section class="grid grid-cols-1 gap-4">
       <ChartCard title="模型请求分布">
         <template #actions>
@@ -97,12 +99,14 @@ import { Button, ChartCard, StatCard } from 'nanocat-ui'
 import PageLoadingState from '@/components/ai/PageLoadingState.vue'
 import StateBlock from '@/components/ai/StateBlock.vue'
 import TimeRangeTabs from '@/components/ai/TimeRangeTabs.vue'
+import AccountAvailabilityCard from '@/components/AccountAvailabilityCard.vue'
 import { useDashboardPage } from './dashboard/useDashboardPage'
 
 defineOptions({ name: 'Dashboard' })
 
 const {
   stats,
+  availability,
   dashboardDataReady,
   dashboardLoading,
   dashboardLoadError,

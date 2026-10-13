@@ -17,6 +17,12 @@
       </div>
     </FormSection>
 
+    <FormSection title="图片超分">
+      <Checkbox v-model="settings.image_upscale_enabled">按请求尺寸放大图片</Checkbox>
+      <FormField label="处理引擎"><select v-model="settings.image_upscale_engine" class="ui-input w-full"><option value="go">Go（无需额外服务）</option><option value="sharp">Sharp</option><option value="pillow">Pillow</option><option value="fsrcnn">FSRCNN</option></select></FormField>
+      <p class="text-xs text-muted-foreground">Sharp、Pillow 和 FSRCNN 需启动图片处理服务；Go 使用本地插值。</p>
+    </FormSection>
+
     <FormSection title="图片确认">
       <div class="settings-check-grid settings-check-grid--single">
         <div class="settings-check-item">
@@ -37,7 +43,7 @@
           :model-value="imageSettleSecondsField.input.value"
           type="number"
           block
-          placeholder="5"
+          placeholder="2"
           :disabled="!settings.image_settle_enabled"
           @update:model-value="imageSettleSecondsField.update"
         />

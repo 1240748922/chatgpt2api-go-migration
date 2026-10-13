@@ -124,6 +124,7 @@
             @edit-tags="openTagEditor"
             @download="downloadFile"
             @delete="handleDelete"
+            @push="pushToGenbox"
             @tag-click="setTagFilter"
           />
         </div>
@@ -308,6 +309,7 @@ import SelectionBulkBar from '@/components/ai/SelectionBulkBar.vue'
 import StateBlock from '@/components/ai/StateBlock.vue'
 import GroupedSelectMenu from '@/components/ui/GroupedSelectMenu.vue'
 import { useConfirmDialog } from '@/composables/useConfirmDialog'
+import { pushGalleryToGenbox } from '@/api/gallery'
 import { useToast } from '@/composables/useToast'
 import { usePageRuntime } from '@/composables/usePageRuntime'
 import { useGalleryFileActions } from '@/composables/useGalleryFileActions'
@@ -334,6 +336,15 @@ const GalleryTagEditorModal = defineAsyncComponent(() => import('@/components/ai
 const OperationProgressModal = defineAsyncComponent(() => import('@/components/ai/OperationProgressModal.vue'))
 
 const toast = useToast()
+const genboxPending = new Set<string>()
+async function pushToGenbox(file: GalleryFile) {
+  if (genboxPending.has(file.path)) return
+  genboxPending.add(file.path)
+  try { const result = await pushGalleryToGenbox(file.path); toast.success(result.label || '推送完成') }
+  catch (error) { toast.error(errorMessage(error, 'GenBox 推送失败')) }
+  finally { genboxPending.delete(file.path); await loadGallery() }
+}
+
 const confirmDialog = useConfirmDialog()
 
 const storageStats = ref<ImageStorageStats | null>(null)

@@ -39,6 +39,7 @@ func TestChatCompletionJSONAndSSE(t *testing.T) {
 	root := t.TempDir()
 	cfg := chatTestConfig(root, upstream.URL)
 	server := New(cfg)
+	t.Cleanup(func() { _ = server.Close() })
 	if _, _, _, err := server.store.AddAccounts([]string{"chat-token"}, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -77,6 +78,7 @@ func TestChatRetriesAnotherAccount(t *testing.T) {
 
 	root := t.TempDir()
 	server := New(chatTestConfig(root, upstream.URL))
+	t.Cleanup(func() { _ = server.Close() })
 	if _, _, _, err := server.store.AddAccounts([]string{"first", "second"}, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -115,6 +117,7 @@ func TestConsoleChatAndResponses(t *testing.T) {
 	cfg := chatTestConfig(root, upstream.URL)
 	cfg.ConsoleURL = upstream.URL
 	server := New(cfg)
+	t.Cleanup(func() { _ = server.Close() })
 	if _, _, _, err := server.store.AddAccounts([]string{"console-token"}, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -153,6 +156,7 @@ func TestChatToolCallsJSONAndStream(t *testing.T) {
 	defer upstream.Close()
 	root := t.TempDir()
 	server := New(chatTestConfig(root, upstream.URL))
+	t.Cleanup(func() { _ = server.Close() })
 	if _, _, _, err := server.store.AddAccounts([]string{"tool-token"}, nil); err != nil {
 		t.Fatal(err)
 	}

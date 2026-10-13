@@ -1,5 +1,6 @@
 <template>
   <div class="register-page">
+    <ChatGPTReplenishment />
     <PagePanel class="space-y-4">
       <PanelHeader title="注册账号" align="start">
         <template #actions>
@@ -151,6 +152,7 @@
 </template>
 
 <script setup lang="ts">
+import ChatGPTReplenishment from '@/components/ChatGPTReplenishment.vue'
 import { computed, nextTick, ref, watch } from 'vue'
 import { Icon } from '@iconify/vue'
 import { useRoute, useRouter } from 'vue-router'

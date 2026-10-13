@@ -15,11 +15,12 @@ import (
 	"sync"
 	"time"
 
+	"github.com/auucoder/gptgrok2api-go/internal/openaiidentity"
 	proxyruntime "github.com/auucoder/gptgrok2api-go/internal/proxy"
 )
 
 const (
-	openAIOAuthClientID = "app_2SKx67EdpoN0G6j64fRvigXD"
+	openAIOAuthClientID = openaiidentity.PlatformClientID
 	openAIUserAgent     = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
 	openAIClientVersion = "prod-a194cd50d4416d3c0b47c740f206b12ce60f5887"
 	openAIClientBuild   = "6708908"
@@ -37,6 +38,9 @@ type AccountRefreshResult struct {
 }
 
 type OpenAIAccountClient struct {
+	MinimumValidity  time.Duration
+	OnRefreshStart   func() error
+	OnTokenRotation  func(AccountRefreshResult) error
 	BaseURL          string
 	OAuthURL         string
 	HTTP             *http.Client
@@ -46,9 +50,10 @@ type OpenAIAccountClient struct {
 	ClearanceTimeout time.Duration
 	clearanceMu      sync.Mutex
 	clearance        map[string]clearanceBundle
-	browserMu        sync.Mutex
-	browsers         map[string]*browserHTTP
+	browserPool      isolatedBrowserPool
 }
+
+func (c *OpenAIAccountClient) Close() { c.browserPool.closeIdle() }
 
 func NewOpenAIAccountClient(baseURL, oauthURL string, client *http.Client, proxy *proxyruntime.Manager, clearance ...ClearanceConfig) *OpenAIAccountClient {
 	if client == nil {
@@ -67,7 +72,6 @@ func NewOpenAIAccountClient(baseURL, oauthURL string, client *http.Client, proxy
 		ClearanceEnabled: settings.Enabled,
 		ClearanceTimeout: settings.Timeout,
 		clearance:        map[string]clearanceBundle{},
-		browsers:         map[string]*browserHTTP{},
 	}
 }
 
@@ -101,28 +105,32 @@ type flareSolverrResponse struct {
 
 func (c *OpenAIAccountClient) RefreshAccount(ctx context.Context, account map[string]any) (AccountRefreshResult, error) {
 	accessToken := aiString(account, "access_token", "accessToken", "token")
-	if accessToken == "" {
+	if accessToken == "" && aiString(account, "refresh_token") == "" {
 		return AccountRefreshResult{}, errors.New("access_token is required")
 	}
 	activeToken := accessToken
 	rotated := AccountRefreshResult{AccessToken: accessToken}
 
-	// Browser sessions are not Platform OAuth credentials. They can still be
-	// retried after a 401, but must not be proactively sent to oauth.openai.com.
-	if !strings.EqualFold(aiString(account, "source_type"), "chatgpt_web") && aiString(account, "refresh_token") != "" && tokenNeedsRefresh(activeToken) {
+	// Only renew an expired or imminently expiring credential, once per operation.
+	refreshAttempted := false
+	usableRT := aiString(account, "refresh_token") != "" && aiString(account, "refresh_token_invalid_at") == ""
+	if usableRT && (activeToken == "" || tokenNeedsRefreshWithin(activeToken, max(5*time.Minute, c.MinimumValidity))) {
+		refreshAttempted = true
 		if tokens, err := c.refreshOAuth(ctx, aiString(account, "refresh_token"), account); err == nil {
 			activeToken = tokens.AccessToken
 			rotated.AccessToken = tokens.AccessToken
 			rotated.RefreshToken = tokens.RefreshToken
 			rotated.IDToken = tokens.IDToken
+		} else {
+			return rotated, err
 		}
 	}
 
 	fields, err := c.fetchUserInfo(ctx, activeToken, account)
-	if errors.Is(err, ErrInvalidAccessToken) && aiString(account, "refresh_token") != "" {
+	if errors.Is(err, ErrInvalidAccessToken) && !refreshAttempted && usableRT {
 		tokens, refreshErr := c.refreshOAuth(ctx, aiString(account, "refresh_token"), account)
 		if refreshErr != nil {
-			return AccountRefreshResult{}, fmt.Errorf("access token invalid and oauth refresh failed: %w", refreshErr)
+			return AccountRefreshResult{}, fmt.Errorf("access token invalid and oauth refresh failed: %w", errors.Join(ErrInvalidAccessToken, refreshErr))
 		}
 		activeToken = tokens.AccessToken
 		rotated.AccessToken = tokens.AccessToken
@@ -131,7 +139,7 @@ func (c *OpenAIAccountClient) RefreshAccount(ctx context.Context, account map[st
 		fields, err = c.fetchUserInfo(ctx, activeToken, account)
 	}
 	if err != nil {
-		return AccountRefreshResult{}, err
+		return rotated, err
 	}
 	rotated.Fields = fields
 	return rotated, nil
@@ -151,7 +159,7 @@ func (c *OpenAIAccountClient) RefreshAccessToken(ctx context.Context, account ma
 	}
 	fields, err := c.fetchUserInfo(ctx, rotated.AccessToken, account)
 	if err != nil {
-		return AccountRefreshResult{}, fmt.Errorf("新 access token 验证失败: %w", err)
+		return rotated, fmt.Errorf("新 access token 验证失败: %w", err)
 	}
 	rotated.Fields = fields
 	return rotated, nil
@@ -184,6 +192,7 @@ func (c *OpenAIAccountClient) fetchUserInfo(ctx context.Context, accessToken str
 		"email":               me["email"],
 		"user_id":             me["id"],
 		"type":                planType,
+		"plan_type":           planType,
 		"quota":               quota,
 		"image_quota_unknown": unknown,
 		"limits_progress":     limits,
@@ -286,29 +295,12 @@ func (c *OpenAIAccountClient) doChatGPT(req *http.Request, proxyURL string) (*ht
 	if !browserEligible(c.BaseURL) {
 		return c.HTTP.Do(req)
 	}
-	browser, err := c.browserFor(proxyURL)
+	browser, release, err := c.browserPool.acquire(browserIdentity(req.Header.Get("Authorization"), proxyURL), proxyURL, c.HTTP.Timeout)
 	if err != nil {
 		return nil, fmt.Errorf("create Chrome TLS client: %w", err)
 	}
+	defer release()
 	return browser.Do(req)
-}
-
-func (c *OpenAIAccountClient) browserFor(proxyURL string) (*browserHTTP, error) {
-	c.browserMu.Lock()
-	defer c.browserMu.Unlock()
-	if browser := c.browsers[proxyURL]; browser != nil {
-		return browser, nil
-	}
-	timeout := c.HTTP.Timeout
-	if timeout <= 0 {
-		timeout = 45 * time.Second
-	}
-	browser, err := newBrowserHTTP(proxyURL, timeout)
-	if err != nil {
-		return nil, err
-	}
-	c.browsers[proxyURL] = browser
-	return browser, nil
 }
 
 func browserEligible(baseURL string) bool {
@@ -417,7 +409,7 @@ func (c *OpenAIAccountClient) refreshOAuth(ctx context.Context, refreshToken str
 	form := url.Values{}
 	form.Set("grant_type", "refresh_token")
 	form.Set("refresh_token", refreshToken)
-	form.Set("client_id", openAIOAuthClientID)
+	form.Set("client_id", openaiidentity.ClientID(account))
 	req, err := http.NewRequestWithContext(proxyruntime.WithURL(ctx, c.ProxyURL(account)), http.MethodPost, c.OAuthURL, strings.NewReader(form.Encode()))
 	if err != nil {
 		return AccountRefreshResult{}, err
@@ -425,9 +417,14 @@ func (c *OpenAIAccountClient) refreshOAuth(ctx context.Context, refreshToken str
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("User-Agent", openAIUserAgent)
+	if c.OnRefreshStart != nil {
+		if err = c.OnRefreshStart(); err != nil {
+			return AccountRefreshResult{}, err
+		}
+	}
 	response, err := c.HTTP.Do(req)
 	if err != nil {
-		return AccountRefreshResult{}, err
+		return AccountRefreshResult{}, &OAuthRefreshError{Uncertain: true, Message: "oauth refresh transport failure"}
 	}
 	defer response.Body.Close()
 	var value map[string]any
@@ -435,9 +432,18 @@ func (c *OpenAIAccountClient) refreshOAuth(ctx context.Context, refreshToken str
 	accessToken := aiString(value, "access_token")
 	if response.StatusCode != http.StatusOK || accessToken == "" {
 		detail := aiString(value, "error_description", "error", "message")
-		return AccountRefreshResult{}, fmt.Errorf("oauth refresh HTTP %d: %s", response.StatusCode, detail)
+		if obj, ok := value["error"].(map[string]any); ok {
+			detail = aiString(obj, "code", "message")
+		}
+		return AccountRefreshResult{}, &OAuthRefreshError{Status: response.StatusCode, Uncertain: response.StatusCode >= 500 || response.StatusCode == 200, Message: detail}
 	}
-	return AccountRefreshResult{AccessToken: accessToken, RefreshToken: aiString(value, "refresh_token"), IDToken: aiString(value, "id_token")}, nil
+	result := AccountRefreshResult{AccessToken: accessToken, RefreshToken: aiString(value, "refresh_token"), IDToken: aiString(value, "id_token")}
+	if c.OnTokenRotation != nil {
+		if err = c.OnTokenRotation(result); err != nil {
+			return result, &OAuthRefreshError{Uncertain: true, Message: "persist rotated credential failed"}
+		}
+	}
+	return result, nil
 }
 
 func (c *OpenAIAccountClient) ProxyURL(account map[string]any) string {
@@ -495,6 +501,9 @@ func extractImageQuota(items []any) (int, any, bool) {
 }
 
 func tokenNeedsRefresh(token string) bool {
+	return tokenNeedsRefreshWithin(token, 5*time.Minute)
+}
+func tokenNeedsRefreshWithin(token string, minimum time.Duration) bool {
 	parts := strings.Split(token, ".")
 	if len(parts) != 3 {
 		return false
@@ -508,7 +517,7 @@ func tokenNeedsRefresh(token string) bool {
 		return false
 	}
 	exp, ok := claims["exp"].(float64)
-	return ok && exp > 0 && time.Until(time.Unix(int64(exp), 0)) <= 24*time.Hour
+	return ok && exp > 0 && time.Until(time.Unix(int64(exp), 0)) <= minimum
 }
 
 func aiString(value map[string]any, keys ...string) string {

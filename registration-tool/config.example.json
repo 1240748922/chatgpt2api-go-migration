@@ -1,0 +1,176 @@
+{
+  "chatgpt": {
+    "auth_base_url": "https://auth.openai.com",
+    "chat_base_url": "https://chatgpt.com",
+    "chat_web_client_id": "app_X8zY6vW2pQ9tR3dE7nK1jL5gH"
+  },
+  "mailbox_proxy": "",
+  "proxy": {
+    "registration": "",
+    "default": "",
+    "pool": []
+  },
+  "registration": {
+    "password_random_length": 12,
+    "password_suffix": "",
+    "password_charset": "",
+    "retry_attempts": 2,
+    "retry_delay_seconds": 1,
+    "at_stability_probe_count": 2,
+    "at_stability_probe_delay_seconds": 10,
+    "at_probe_timeout_seconds": 30,
+    "stage_concurrency": {
+      "auth": 1,
+      "network": 4,
+      "at_probe": 4
+    }
+  },
+  "email_registration": {
+    "registration_mode": "passwordless",
+    "use_as_username": false,
+    "token_file": "mailbox_tokens.txt",
+    "auth_fingerprint": {
+      "mode": "fixed",
+      "profile": "chrome146",
+      "profiles": [
+        "chrome146"
+      ]
+    },
+    "remail": {
+      "enabled": false,
+      "base_url": "https://remail.aishop6.com",
+      "api_key": "",
+      "project_id": 2,
+      "service_mode": "purchase",
+      "supply": "private_first",
+      "email_suffix": "outlook.com",
+      "otp_poll_interval": 1,
+      "batch_timeout": 200,
+      "exclude_dead_history": true,
+      "dead_registry_file": "runtime/remail_dead_accounts.json",
+      "supplier_dead_rate_stop_threshold": 0.25
+    },
+    "smailr": {
+      "enabled": false,
+      "base_url": "https://smailr.com",
+      "api_key": "",
+      "domains": [
+        "smailr.com",
+        "loc.cc",
+        "mail.nodeloc.cc",
+        "nodeloc.cc"
+      ],
+      "default_domain": "smailr.com",
+      "domain_ids": {},
+      "reuse_existing_on_level_error": true,
+      "timeout": 30
+    },
+    "otp_poll_interval": 2,
+    "sentinel_version": "20260219f9f6",
+    "sentinel_max_concurrency": 2,
+    "sentinel_prewarm_window": 4,
+    "sentinel_circuit_failures": 3,
+    "sentinel_circuit_cooldown_seconds": 60,
+    "remail_otp_issued_after_grace_seconds": 90,
+    "remail_otp_resend_after_seconds": 30,
+    "smailr_otp_issued_after_grace_seconds": 10,
+    "cfworker_otp_settle_seconds": 3,
+    "cfworker_timeout_seconds": 30,
+    "cfworker_otp_issued_after_grace_seconds": 10,
+    "cfworker_poll_proxy": true,
+    "cfworker_direct_fallback": false,
+    "cfworker_url": "https://tempmail.example.com",
+    "cfworker_domain": "example.com",
+    "cfworker_admin_token": "",
+    "cfworker_api_token": "",
+    "email": "",
+    "password": "",
+    "refresh_token": "",
+    "access_token": "",
+    "gmail": {
+      "enabled": false,
+      "auth_mode": "app_password",
+      "email": "",
+      "app_password": "",
+      "login_password": "",
+      "refresh_token": "",
+      "access_token": "",
+      "client_id": "",
+      "client_secret": "",
+      "token_url": "https://oauth2.googleapis.com/token",
+      "imap_enabled": true,
+      "imap_host": "imap.gmail.com",
+      "imap_port": 993,
+      "imap_folders": [
+        "INBOX",
+        "[Gmail]/Spam",
+        "[Gmail]/All Mail"
+      ],
+      "smtp_host": "smtp.gmail.com",
+      "smtp_port": 465,
+      "smtp_use_ssl": true,
+      "sender_name": ""
+    },
+    "oauth_client_id": "9e5f94bc-e8a4-4e73-b8be-63364c29d753",
+    "oauth_scope": "https://graph.microsoft.com/.default offline_access",
+    "oauth_token_url": "https://login.microsoftonline.com/common/oauth2/v2.0/token",
+    "graph_messages_url": "https://graph.microsoft.com/v1.0/me/messages",
+    "chongzhi": {
+      "enabled": true,
+      "api_url": "https://www.chongzhi.art/api/mailbox/fetch",
+      "rate_limit_seconds": 32,
+      "timeout": 30
+    }
+  },
+  "timeouts": {
+    "request": 20,
+    "http_retries": 3,
+    "retry_delay": 2,
+    "token_cache_ttl": 300
+  },
+  "runtime": {
+    "directory": "runtime"
+  },
+  "storage": {
+    "sqlite_path": "runtime/accounts.sqlite3"
+  },
+  "codex_oauth": {
+    "allow_passwordless_takeover": false,
+    "auto_phone_verification": false,
+    "require_registration_refresh_token": true,
+    "require_registration_phone_verification": true,
+    "registration_timeout": 180
+  },
+  "phone_reuse": {
+    "source": "smsbower",
+    "max_reuse_count": 1,
+    "send_cooldown_seconds": 45,
+    "send_retry_attempts": 3,
+    "send_retry_delay_seconds": 45,
+    "state_file": "runtime/phone_reuse_state.json",
+    "proxy": "",
+    "proxy_match_phone_country": false,
+    "proxy_random_sid": false,
+    "smsbower": {
+      "api_key": "",
+      "service": "dr",
+      "service_name": "OpenAI (ChatGPT)",
+      "country": "38",
+      "country_name": "Ghana",
+      "country_prefix": "+233",
+      "min_price": "0.054",
+      "target_price": "0.054",
+      "max_price": "0.054",
+      "sms_timeout": 120,
+      "sms_poll_interval": 5,
+      "number_attempts": 3,
+      "send_cooldown_seconds": 45,
+      "send_retry_attempts": 3,
+      "send_retry_delay_seconds": 45
+    }
+  },
+  "output": {
+    "directory": "sessions",
+    "filename_pattern": "session_{email}_{timestamp}.json"
+  }
+}

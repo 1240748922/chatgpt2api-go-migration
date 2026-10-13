@@ -51,6 +51,8 @@ function adaptDashboardToStats(dashboard: DashboardResponse): AdminStats {
 
   return {
     total_accounts: total,
+    availability: dashboard.availability,
+    current_concurrency: dashboard.current_concurrency,
     active_accounts: active,
     abnormal_accounts: abnormal,
     disabled_accounts: disabled,

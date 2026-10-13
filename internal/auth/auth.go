@@ -9,16 +9,30 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 
 	"github.com/auucoder/gptgrok2api-go/internal/store"
 )
 
 type Validator struct {
+	mu             sync.RWMutex
 	apiKey         string
 	adminKey       string
 	authKeysPath   string
 	allowAnonymous bool
 	repository     *store.Store
+}
+
+func (v *Validator) UpdateKeys(apiKey, adminKey string) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.apiKey, v.adminKey = strings.TrimSpace(apiKey), strings.TrimSpace(adminKey)
+}
+
+func (v *Validator) Keys() (string, string) {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	return v.apiKey, v.adminKey
 }
 
 func New(apiKey, adminKey, authKeysPath string, allowAnonymous bool, repository *store.Store) *Validator {
@@ -49,6 +63,8 @@ func (v *Validator) AdminKey(r *http.Request) string {
 }
 
 func (v *Validator) ValidAPIRequest(r *http.Request) bool {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
 	token := v.APIKey(r)
 	if token == "" {
 		return v.allowAnonymous
@@ -60,11 +76,16 @@ func (v *Validator) ValidAPIRequest(r *http.Request) bool {
 		if _, ok := v.repository.Authenticate(token); ok {
 			return true
 		}
+		if v.repository.Shared() {
+			return false
+		}
 	}
 	return v.matchesStoredHash(token)
 }
 
 func (v *Validator) ValidAdminRequest(r *http.Request) bool {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
 	token := v.AdminKey(r)
 	if token == "" {
 		return false
@@ -80,6 +101,11 @@ func (v *Validator) ValidAdminRequest(r *http.Request) bool {
 }
 
 func (v *Validator) Identity(token string) (store.Identity, bool) {
+	if v == nil {
+		return store.Identity{}, false
+	}
+	v.mu.RLock()
+	defer v.mu.RUnlock()
 	token = strings.TrimSpace(token)
 	if token == "" {
 		return store.Identity{}, false
@@ -100,6 +126,8 @@ func (v *Validator) Identity(token string) (store.Identity, bool) {
 }
 
 func (v *Validator) HasConfiguredKey() bool {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
 	return v.apiKey != "" || v.adminKey != "" || v.authKeysPath != ""
 }
 

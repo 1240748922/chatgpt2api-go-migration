@@ -31,7 +31,7 @@
         </FormField>
 
         <FormField label="密码">
-          <Input v-model="imageStorage.webdav_password" type="password" block />
+          <Input v-model="imageStorage.webdav_password" type="password" block :placeholder="imageStorage.has_webdav_password ? '已设置，留空保留' : 'WebDAV 密码'" />
         </FormField>
       </div>
 
@@ -75,12 +75,14 @@
       </FormField>
 
       <FormField label="API Key">
-        <Input v-model="settings.ai_review.api_key" type="password" block placeholder="sk-..." />
+        <Input v-model="settings.ai_review.api_key" type="password" block :placeholder="settings.ai_review.has_api_key ? '已设置，留空保留' : 'sk-...'" />
       </FormField>
 
       <FormField label="Model">
         <Input v-model.trim="settings.ai_review.model" block placeholder="填写审核服务支持的模型 ID" />
       </FormField>
+
+      <Checkbox v-model="settings.ai_review.fail_open">审核服务故障时允许请求继续</Checkbox>
 
       <FormField label="审核提示词">
         <textarea
@@ -90,6 +92,15 @@
           placeholder="判断用户请求是否允许。只回答 ALLOW 或 REJECT。"
         ></textarea>
       </FormField>
+    </FormSection>
+    <FormSection title="GenBox 推送" class="settings-storage-main">
+      <Checkbox v-model="settings.genbox_push.enabled">启用 GenBox</Checkbox>
+      <FormField label="GenBox 地址"><Input v-model.trim="settings.genbox_push.base_url" block placeholder="https://genbox.example.com" /></FormField>
+      <FormField label="来源标识"><Input v-model.trim="settings.genbox_push.source_id" block /></FormField>
+      <FormField label="推送密钥"><Input v-model="settings.genbox_push.push_key" type="password" block :placeholder="settings.genbox_push.has_push_key ? '已设置，留空保留' : 'GenBox 推送密钥'" /></FormField>
+      <FormField label="超时（秒）"><Input v-model.number="settings.genbox_push.timeout_secs" type="number" min="5" max="120" block /></FormField>
+      <Checkbox v-model="settings.genbox_push.auto_push_after_studio">工作台生成后自动推送</Checkbox>
+      <p class="text-xs text-muted-foreground">图库中可手动推送。收到有效回执后显示结果；推送保留源图。</p>
     </FormSection>
   </div>
 </template>

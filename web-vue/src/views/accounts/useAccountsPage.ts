@@ -444,6 +444,7 @@ export function useAccountsPage() {
     viewMode,
     refreshingAccountId,
     resettingAccountId,
+    ...accountImport,
     importBusy,
     exportBusy,
     showImportModal,

@@ -46,6 +46,7 @@ func TestAccountRefreshHTTPFlowPersistsRemoteFieldsAndRedactsSecrets(t *testing.
 		OpenAIOAuthURL: upstream.URL + "/oauth/token",
 	}
 	server := New(cfg)
+	t.Cleanup(func() { _ = server.Close() })
 	_, _, _, err := server.store.AddAccounts(nil, []map[string]any{{
 		"access_token": "access-1", "refresh_token": "refresh-secret", "id_token": "id-secret", "source_type": "chatgpt_web",
 		"status": "异常", "invalid_count": 2, "status_reason_code": "auth_invalid", "last_error_kind": "auth_invalid",
@@ -266,7 +267,9 @@ func newAccountRefreshTestServer(t *testing.T, upstreamURL string) *Server {
 		OpenAIBaseURL:  upstreamURL,
 		OpenAIOAuthURL: upstreamURL + "/oauth/token",
 	}
-	return New(cfg)
+	server := New(cfg)
+	t.Cleanup(func() { _ = server.Close() })
+	return server
 }
 
 func runAccountRefreshForTest(t *testing.T, handler http.Handler, refs []string) map[string]any {

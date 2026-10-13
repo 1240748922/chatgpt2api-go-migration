@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"archive/zip"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,11 +12,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 )
-
-var imageTagsMu sync.Mutex
 
 func (s *Server) adminImages(w http.ResponseWriter, r *http.Request) {
 	if !s.requireAdmin(w, r) {
@@ -38,8 +36,10 @@ func (s *Server) adminImages(w http.ResponseWriter, r *http.Request) {
 		s.deleteImageTag(w, tag)
 	case path == "/storage" && r.Method == http.MethodGet:
 		s.imageStorage(w)
+	case path == "/genbox-push" && r.Method == http.MethodPost:
+		s.genboxPushAPI(w, r)
 	case path == "/storage/compress" && r.Method == http.MethodPost:
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "compressed": 0, "saved_bytes": 0, "message": "Go runtime does not recompress source media"})
+		s.compressImageStorage(w, r)
 	case path == "/storage/cleanup-to-target" && r.Method == http.MethodPost:
 		s.imageStorageCleanup(w, r)
 	case path == "/delete" && r.Method == http.MethodPost:
@@ -57,7 +57,21 @@ func (s *Server) listAdminImages(w http.ResponseWriter, r *http.Request) {
 	items := make([]map[string]any, 0)
 	items = append(items, listMediaItems(s.cfg.ImageDataDir, "image", "")...)
 	items = append(items, listMediaItems(s.cfg.VideoDataDir, "video", "video/")...)
-	tags := s.loadImageTags()
+	remote, remoteErr := s.remoteImageItems()
+	if remoteErr != nil {
+		writeError(w, 503, "图片索引读取失败", "storage_error")
+		return
+	}
+	items = append(items, remote...)
+	if err := s.decorateGenbox(items); err != nil {
+		writeError(w, 503, "图片推送状态读取失败", "storage_error")
+		return
+	}
+	tags, err := s.loadImageTagsChecked()
+	if err != nil {
+		writeError(w, 503, "读取图片标签失败", "storage_error")
+		return
+	}
 	query := r.URL.Query()
 	mediaType := strings.ToLower(strings.TrimSpace(query.Get("media_type")))
 	tag := strings.TrimSpace(query.Get("tag"))
@@ -102,7 +116,7 @@ func listMediaItems(root, kind, prefix string) []map[string]any {
 	entries, _ := os.ReadDir(root)
 	items := make([]map[string]any, 0, len(entries))
 	for _, entry := range entries {
-		if entry.IsDir() || strings.HasSuffix(entry.Name(), ".meta.json") {
+		if entry.IsDir() || entry.Type()&os.ModeSymlink != 0 || strings.HasSuffix(entry.Name(), ".meta.json") || !isMediaStorageFile(entry.Name()) {
 			continue
 		}
 		info, err := entry.Info()
@@ -114,7 +128,7 @@ func listMediaItems(root, kind, prefix string) []map[string]any {
 			continue
 		}
 		rel := prefix + filepath.ToSlash(entry.Name())
-		value := map[string]any{"path": rel, "rel": rel, "name": entry.Name(), "filename": entry.Name(), "type": kind, "size": info.Size(), "bytes": info.Size(), "updated_at": info.ModTime().UTC(), "url": "/images/" + rel}
+		value := map[string]any{"path": rel, "rel": rel, "name": entry.Name(), "filename": entry.Name(), "type": kind, "size": info.Size(), "bytes": info.Size(), "updated_at": info.ModTime().UTC(), "url": "/images/" + rel, "thumbnail_url": "/image-thumbnails/" + rel}
 		if meta := mediaMetadata(path); meta != nil {
 			for key, item := range meta {
 				value[key] = item
@@ -145,7 +159,7 @@ func (s *Server) publicImage(w http.ResponseWriter, r *http.Request) {
 	if strings.HasPrefix(r.URL.Path, "/image-thumbnails/") {
 		path = strings.TrimPrefix(r.URL.Path, "/image-thumbnails/")
 	}
-	if path == "" || strings.Contains(path, "\\") {
+	if path == "" || strings.Contains(path, "\\") || !isImageStorageFile(path) {
 		writeError(w, http.StatusBadRequest, "invalid image path", "invalid_request_error")
 		return
 	}
@@ -155,8 +169,15 @@ func (s *Server) publicImage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	filePath := filepath.Join(root, path)
-	if _, err := os.Stat(filePath); err != nil {
+	if !regularFileWithin(root, filePath) {
+		if s.serveRemoteImage(w, r, filepath.ToSlash(path)) {
+			return
+		}
 		writeError(w, http.StatusNotFound, "image not found", "not_found")
+		return
+	}
+	if strings.HasPrefix(r.URL.Path, "/image-thumbnails/") {
+		s.serveThumbnail(w, r, filePath)
 		return
 	}
 	if contentType := mime.TypeByExtension(filepath.Ext(filePath)); contentType != "" {
@@ -176,7 +197,12 @@ func (s *Server) deleteAdminImages(w http.ResponseWriter, r *http.Request) {
 	paths := request.Paths
 	if request.AllMatching {
 		paths = nil
-		for _, item := range listMediaItems(s.cfg.ImageDataDir, "image", "") {
+		remote, e := s.remoteImageItems()
+		if e != nil {
+			writeError(w, 503, "图片索引读取失败", "storage_error")
+			return
+		}
+		for _, item := range append(listMediaItems(s.cfg.ImageDataDir, "image", ""), remote...) {
 			paths = append(paths, stringValue(item["path"]))
 		}
 	}
@@ -191,30 +217,39 @@ func (s *Server) deleteAdminImages(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) removeMediaPath(value string) bool {
 	root := s.cfg.ImageDataDir
+	tagPath := filepath.ToSlash(strings.TrimSpace(value))
 	value = filepath.ToSlash(strings.TrimSpace(value))
 	if strings.HasPrefix(value, "video/") {
 		root = s.cfg.VideoDataDir
 		value = strings.TrimPrefix(value, "video/")
 	}
 	path := filepath.Join(root, filepath.FromSlash(value))
-	if !isWithin(root, path) || filepath.Clean(path) == filepath.Clean(root) {
+	if s.store != nil && root == s.cfg.ImageDataDir && validImageRel(value) {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if managed, removed := s.tombstoneRemoteImage(ctx, value); managed {
+			return removed
+		}
+	}
+	if !isMediaStorageFile(path) || !regularFileWithin(root, path) {
 		return false
 	}
 	if os.Remove(path) == nil {
 		_ = os.Remove(path + ".meta.json")
-		s.removeImageTags(value)
+		if root == s.cfg.ImageDataDir {
+			_ = os.Remove(s.thumbnailPath(path))
+		}
+		s.removeImageTags(tagPath)
 		return true
 	}
 	return false
 }
 
 func (s *Server) removeImageTags(path string) {
-	all := s.loadImageTags()
-	if _, ok := all[path]; !ok {
+	if s.store == nil {
 		return
 	}
-	delete(all, path)
-	_ = s.saveImageTags(all)
+	_, _ = s.mutateImageTags(func(all map[string]any) error { delete(all, path); return nil })
 }
 
 func (s *Server) downloadAdminImages(w http.ResponseWriter, r *http.Request) {
@@ -226,7 +261,7 @@ func (s *Server) downloadAdminImages(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/zip")
 	w.Header().Set("Content-Disposition", `attachment; filename="images.zip"`)
-	if err := s.writeMediaZip(w, request.Paths); err != nil {
+	if err := s.writeMediaZipContext(r.Context(), w, request.Paths); err != nil {
 		return
 	}
 }
@@ -234,6 +269,12 @@ func (s *Server) downloadAdminImages(w http.ResponseWriter, r *http.Request) {
 func (s *Server) downloadSingleImage(w http.ResponseWriter, r *http.Request, path string) {
 	root, clean := s.mediaPath(path)
 	if root == "" {
+		if validImageRel(path) {
+			w.Header().Set("Content-Disposition", `attachment; filename="`+path+`"`)
+			if s.serveRemoteImage(w, r, path) {
+				return
+			}
+		}
 		writeError(w, http.StatusNotFound, "image not found", "not_found")
 		return
 	}
@@ -242,17 +283,29 @@ func (s *Server) downloadSingleImage(w http.ResponseWriter, r *http.Request, pat
 }
 
 func (s *Server) writeMediaZip(w io.Writer, paths []string) error {
+	return s.writeMediaZipContext(context.Background(), w, paths)
+}
+func (s *Server) writeMediaZipContext(ctx context.Context, w io.Writer, paths []string) error {
 	archive := zip.NewWriter(w)
 	defer archive.Close()
 	used := map[string]bool{}
 	added := 0
 	for _, item := range paths {
-		root, clean := s.mediaPath(item)
-		if root == "" {
-			continue
+		if err := ctx.Err(); err != nil {
+			return err
 		}
-		path := filepath.Join(root, clean)
-		raw, err := os.ReadFile(path)
+		root, clean := s.mediaPath(item)
+		var raw []byte
+		var err error
+		if root == "" {
+			if !validImageRel(item) {
+				continue
+			}
+			clean = item
+			raw, err = s.remoteImageBytes(ctx, item)
+		} else {
+			raw, err = os.ReadFile(filepath.Join(root, clean))
+		}
 		if err != nil {
 			continue
 		}
@@ -291,44 +344,93 @@ func (s *Server) mediaPath(value string) (string, string) {
 	if !isWithin(root, path) || filepath.Clean(path) == filepath.Clean(root) {
 		return "", ""
 	}
-	if _, err := os.Stat(path); err != nil {
+	if !regularFileWithin(root, path) || !isMediaStorageFile(path) {
 		return "", ""
 	}
 	return root, clean
 }
 
-func (s *Server) tagsPath() string { return filepath.Join(s.cfg.DataDir, "image_tags.json") }
-
-func (s *Server) loadImageTags() map[string]any {
-	imageTagsMu.Lock()
-	defer imageTagsMu.Unlock()
-	raw, err := os.ReadFile(s.tagsPath())
+func regularFileWithin(root, path string) bool {
+	if !isWithin(root, path) || filepath.Clean(root) == filepath.Clean(path) {
+		return false
+	}
+	info, err := os.Lstat(path)
+	if err != nil || !info.Mode().IsRegular() {
+		return false
+	}
+	realRoot, err := filepath.EvalSymlinks(root)
 	if err != nil {
-		return map[string]any{}
+		return false
 	}
-	var tags map[string]any
-	if json.Unmarshal(raw, &tags) != nil {
-		return map[string]any{}
-	}
-	return tags
+	realPath, err := filepath.EvalSymlinks(path)
+	return err == nil && isWithin(realRoot, realPath)
 }
 
-func (s *Server) saveImageTags(tags map[string]any) error {
-	imageTagsMu.Lock()
-	defer imageTagsMu.Unlock()
-	if err := os.MkdirAll(filepath.Dir(s.tagsPath()), 0o755); err != nil {
-		return err
-	}
-	raw, err := json.MarshalIndent(tags, "", "  ")
+func (s *Server) tagsPath() string { return filepath.Join(s.cfg.DataDir, "image_tags.json") }
+
+func (s *Server) loadImageTagsChecked() (map[string]any, error) {
+	d, err := s.store.Document("image-tags")
 	if err != nil {
-		return err
+		return nil, err
 	}
-	return os.WriteFile(s.tagsPath(), append(raw, '\n'), 0o600)
+	if d["items"] != nil {
+		return mapValue(d["items"]), nil
+	}
+	// Only seed the standalone JSON backend; shared storage never trusts stale local files.
+	if !s.store.Shared() {
+		raw, e := os.ReadFile(s.tagsPath())
+		if e != nil && !os.IsNotExist(e) {
+			return nil, e
+		}
+		var tags map[string]any
+		if len(raw) > 0 && json.Unmarshal(raw, &tags) != nil {
+			return nil, fmt.Errorf("invalid image tags")
+		}
+		if tags != nil {
+			return tags, nil
+		}
+	}
+	return map[string]any{}, nil
+}
+func (s *Server) loadImageTags() map[string]any { tags, _ := s.loadImageTagsChecked(); return tags }
+func (s *Server) mutateImageTags(fn func(map[string]any) error) (map[string]any, error) {
+	seed, err := s.loadImageTagsChecked()
+	if err != nil {
+		return nil, err
+	}
+	return s.store.MutateDocument("image-tags", func(d map[string]any) error {
+		tags := mapValue(d["items"])
+		if d["items"] == nil {
+			tags = seed
+		}
+		if err := fn(tags); err != nil {
+			return err
+		}
+		d["items"] = tags
+		return nil
+	})
+}
+func (s *Server) saveImageTags(tags map[string]any) error {
+	_, err := s.mutateImageTags(func(all map[string]any) error {
+		for key := range all {
+			delete(all, key)
+		}
+		for key, value := range tags {
+			all[key] = value
+		}
+		return nil
+	})
+	return err
 }
 
 func (s *Server) listImageTags(w http.ResponseWriter) {
 	all := map[string]bool{}
-	for _, value := range s.loadImageTags() {
+	tags, err := s.loadImageTagsChecked()
+	if err != nil {
+		writeError(w, 503, "读取图片标签失败", "storage_error")
+		return
+	}
+	for _, value := range tags {
 		for _, tag := range stringList(value) {
 			all[tag] = true
 		}
@@ -361,9 +463,8 @@ func (s *Server) updateImageTags(w http.ResponseWriter, r *http.Request) {
 		values = append(values, tag)
 	}
 	sort.Strings(values)
-	all := s.loadImageTags()
-	all[path] = values
-	if err := s.saveImageTags(all); err != nil {
+	_, err := s.mutateImageTags(func(all map[string]any) error { all[path] = values; return nil })
+	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error(), "server_error")
 		return
 	}
@@ -372,26 +473,27 @@ func (s *Server) updateImageTags(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) deleteImageTag(w http.ResponseWriter, tag string) {
 	tag = strings.TrimSpace(tag)
-	all := s.loadImageTags()
 	removed := 0
-	for path, value := range all {
-		values := stringList(value)
-		next := make([]string, 0, len(values))
-		changed := false
-		for _, item := range values {
-			if item == tag {
-				changed = true
-				continue
+	_, err := s.mutateImageTags(func(all map[string]any) error {
+		for path, value := range all {
+			next := []string{}
+			changed := false
+			for _, item := range stringList(value) {
+				if item == tag {
+					changed = true
+				} else {
+					next = append(next, item)
+				}
 			}
-			next = append(next, item)
+			if changed {
+				removed++
+				all[path] = next
+			}
 		}
-		if changed {
-			removed++
-			all[path] = next
-		}
-	}
-	if err := s.saveImageTags(all); err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error(), "server_error")
+		return nil
+	})
+	if err != nil {
+		writeError(w, 503, "更新图片标签失败", "storage_error")
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "removed_from": removed})
@@ -413,6 +515,15 @@ func (s *Server) imageStorage(w http.ResponseWriter) {
 }
 
 func (s *Server) imageStorageCleanup(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Minute)
+	defer cancel()
+	lease, err := s.store.AcquireLease(ctx, "image-storage-maintenance", 30*time.Second)
+	if err != nil || lease == nil {
+		writeError(w, 503, "image storage maintenance is busy", "storage_busy")
+		return
+	}
+	defer lease.Release()
+	lease.KeepAlive(ctx, 30*time.Second, cancel)
 	target := positiveInt(r.URL.Query().Get("target_free_mb"), 500)
 	dryRun := strings.EqualFold(r.URL.Query().Get("dry_run"), "true") || r.URL.Query().Get("dry_run") == "1"
 	totalBytes, _, freeBytes := diskUsage(s.cfg.ImageDataDir)
@@ -423,7 +534,11 @@ func (s *Server) imageStorageCleanup(w http.ResponseWriter, r *http.Request) {
 	currentFree := freeBytes / (1024 * 1024)
 	removed, freed := 0, int64(0)
 	files := imageFilesByAge(s.cfg.ImageDataDir)
+	removedTags := []string{}
 	for _, file := range files {
+		if ctx.Err() != nil {
+			break
+		}
 		if currentFree+uint64(freed/(1024*1024)) >= uint64(target) {
 			break
 		}
@@ -432,12 +547,24 @@ func (s *Server) imageStorageCleanup(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			_ = os.Remove(file.path + ".meta.json")
-			s.removeImageTags(file.rel)
+			_ = os.Remove(s.thumbnailPath(file.path))
+			removedTags = append(removedTags, file.rel)
 		}
 		freed += file.size
 		removed++
 	}
 	if !dryRun {
+		if len(removedTags) > 0 {
+			if _, err := s.mutateImageTags(func(tags map[string]any) error {
+				for _, key := range removedTags {
+					delete(tags, key)
+				}
+				return nil
+			}); err != nil {
+				writeError(w, 503, "media removed but tag cleanup failed", "storage_error")
+				return
+			}
+		}
 		cleanupEmptyDirs(s.cfg.ImageDataDir)
 		_, _, freeBytes = diskUsage(s.cfg.ImageDataDir)
 		currentFree = freeBytes / (1024 * 1024)
@@ -459,7 +586,10 @@ type imageStorageFile struct {
 func imageFilesByAge(root string) []imageStorageFile {
 	files := []imageStorageFile{}
 	_ = filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
-		if err != nil || info == nil || info.IsDir() || strings.HasSuffix(info.Name(), ".meta.json") || !isImageStorageFile(info.Name()) {
+		if info != nil && info.IsDir() && strings.HasPrefix(info.Name(), ".") && path != root {
+			return filepath.SkipDir
+		}
+		if err != nil || info == nil || !info.Mode().IsRegular() || strings.HasSuffix(info.Name(), ".meta.json") || !isImageStorageFile(info.Name()) {
 			return nil
 		}
 		rel, relErr := filepath.Rel(root, path)
@@ -523,4 +653,9 @@ func nonNegativeInt(value string, fallback int) int {
 		return fallback
 	}
 	return number
+}
+
+func isMediaStorageFile(name string) bool {
+	ext := strings.ToLower(filepath.Ext(name))
+	return isImageStorageFile(name) || ext == ".mp4" || ext == ".webm"
 }

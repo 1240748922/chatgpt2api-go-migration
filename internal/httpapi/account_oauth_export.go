@@ -65,7 +65,7 @@ func (s *Server) accountOAuthFinish(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadGateway, refreshErr.Error(), "upstream_error")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"added": 1, "refreshed": 1, "errors": []any{}, "items": accountsForAPI([]map[string]any{result})})
+	writeJSON(w, http.StatusOK, map[string]any{"added": 1, "refreshed": 1, "errors": []any{}, "items": accountsForAPI([]map[string]any{result}, s.configuredImageMinimumValidity())})
 }
 
 func (s *Server) refreshImportedOAuth(ctx context.Context, token string) (map[string]any, error) {
@@ -73,15 +73,7 @@ func (s *Server) refreshImportedOAuth(ctx context.Context, token string) (map[st
 	if err != nil {
 		return nil, err
 	}
-	result, err := s.openAIAccountClient().RefreshAccount(ctx, account)
-	if err != nil {
-		return nil, err
-	}
-	updated, _, err := s.store.RotateAccountTokens(token, result.AccessToken, result.RefreshToken, result.IDToken, result.Fields)
-	if err != nil {
-		return nil, err
-	}
-	return updated, nil
+	return s.syncCredential(ctx, account, false)
 }
 
 func (s *Server) accountExport(w http.ResponseWriter, r *http.Request) {
@@ -93,8 +85,10 @@ func (s *Server) accountExport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		AccessTokens []string `json:"access_tokens"`
-		Format       string   `json:"format"`
+		AccessTokens []string          `json:"access_tokens"`
+		IDs          []string          `json:"account_ids"`
+		Selection    *accountSelection `json:"selection"`
+		Format       string            `json:"format"`
 	}
 	if !decodeJSON(w, r, &body) {
 		return
@@ -103,17 +97,42 @@ func (s *Server) accountExport(w http.ResponseWriter, r *http.Request) {
 	if format == "" {
 		format = "json"
 	}
-	if format == "agent_identity" {
-		s.exportAgentIdentities(w, body.AccessTokens)
+	if format != "json" && format != "txt" && format != "zip" && format != "cpa" && format != "sub2api" && format != "agent_identity" {
+		writeError(w, 400, "unsupported export format", "invalid_request_error")
 		return
 	}
-	accounts, err := s.exportAccounts(body.AccessTokens)
+	refs, err := s.selectedOperationRefs(body.AccessTokens, body.IDs, body.Selection)
+	if err != nil {
+		writeError(w, 400, err.Error(), "invalid_request_error")
+		return
+	}
+	if len(refs) == 0 && (body.Selection != nil || len(body.IDs) > 0 || len(body.AccessTokens) > 0) {
+		writeError(w, 400, "no valid accounts selected", "invalid_request_error")
+		return
+	}
+	if format == "agent_identity" {
+		s.exportAgentIdentities(w, refs)
+		return
+	}
+	accounts, err := s.exportAccounts(refs)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error(), "invalid_request_error")
 		return
 	}
 	stamp := time.Now().Format("20060102-150405")
 	w.Header().Set("Cache-Control", "no-store")
+	if format == "txt" {
+		var lines []string
+		for _, item := range accounts {
+			if item["access_token"] != "" {
+				lines = append(lines, item["access_token"])
+			}
+		}
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.Header().Set("Content-Disposition", `attachment; filename="access-tokens-`+stamp+`.txt"`)
+		_, _ = w.Write([]byte(strings.Join(lines, "\n") + "\n"))
+		return
+	}
 	if format == "zip" || format == "cpa" {
 		data, err := accountExportZip(accounts)
 		if err != nil {
@@ -147,7 +166,10 @@ func (s *Server) exportAccounts(tokens []string) ([]map[string]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	resolved, _ := resolveAccountRefTokens(items, tokens)
+	resolved, missing := resolveAccountRefTokens(items, tokens)
+	if len(missing) > 0 {
+		return nil, errors.New("one or more selected accounts were not found")
+	}
 	targets := map[string]struct{}{}
 	for _, token := range resolved {
 		targets[token] = struct{}{}
@@ -165,14 +187,14 @@ func (s *Server) exportAccounts(tokens []string) ([]map[string]string, error) {
 		}
 	}
 	if len(result) == 0 {
-		return nil, errors.New("没有可导出的完整账号，需要同时有 access_token、refresh_token 和 id_token")
+		return nil, errors.New("没有可导出的账号")
 	}
 	return result, nil
 }
 
 func buildAccountExportItem(account map[string]any) (map[string]string, bool) {
 	access, refresh, id := stringValue(account["access_token"]), stringValue(account["refresh_token"]), stringValue(account["id_token"])
-	if access == "" || refresh == "" || id == "" {
+	if access == "" && refresh == "" {
 		return nil, false
 	}
 	claims, _ := jwtClaims(access)
@@ -343,6 +365,20 @@ func jwtClaims(token string) (map[string]any, error) {
 	return value, err
 }
 func mapValue(value any) map[string]any {
+	switch typed := value.(type) {
+	case map[string]int:
+		result := make(map[string]any, len(typed))
+		for k, v := range typed {
+			result[k] = v
+		}
+		return result
+	case map[string]map[string]int:
+		result := make(map[string]any, len(typed))
+		for k, v := range typed {
+			result[k] = mapValue(v)
+		}
+		return result
+	}
 	result, _ := value.(map[string]any)
 	if result == nil {
 		return map[string]any{}

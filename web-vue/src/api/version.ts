@@ -13,6 +13,7 @@ type UpdateMetaResponse = {
   update_available?: boolean
   status?: string
   error?: string
+  check_message?: string
 }
 
 function toVersionInfo(payload: { version?: string }): VersionInfoResponse {
@@ -55,6 +56,7 @@ export const versionApi = {
       is_latest: Boolean(latestVersion) && !payload.update_available,
       update_available: Boolean(payload.update_available),
       check_error: payload.status === 'error' ? (payload.error || 'GitHub 版本检查失败') : undefined,
+      check_message: payload.check_message,
     }
   },
 }

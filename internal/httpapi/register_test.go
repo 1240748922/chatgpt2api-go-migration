@@ -20,7 +20,9 @@ func TestRegisterCheckoutControlsAndProbeToggle(t *testing.T) {
 	if err := os.WriteFile(cfg.RegisterPath, []byte(config), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	handler := New(cfg).Handler()
+	handlerServer := New(cfg)
+	t.Cleanup(func() { _ = handlerServer.Close() })
+	handler := handlerServer.Handler()
 
 	stopped := adminRequest(handler, http.MethodPost, "/api/register/checkout-retries/stop", nil)
 	if stopped.Code != http.StatusOK || !strings.Contains(stopped.Body.String(), `"checkout_retries_active":false`) {
@@ -54,7 +56,9 @@ func TestRegisterRuntimeSnapshotImportsOnlyEnabledSSOAccounts(t *testing.T) {
 	if err := os.WriteFile(cfg.GrokAccountsPath, []byte(archive), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	handler := New(cfg).Handler()
+	handlerServer := New(cfg)
+	t.Cleanup(func() { _ = handlerServer.Close() })
+	handler := handlerServer.Handler()
 	response := adminRequest(handler, http.MethodPost, "/api/register/grok/accounts/runtime/snapshot", nil)
 	if response.Code != http.StatusOK {
 		t.Fatalf("snapshot failed: %d %s", response.Code, response.Body.String())

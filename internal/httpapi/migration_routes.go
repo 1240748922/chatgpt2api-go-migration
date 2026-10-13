@@ -17,9 +17,9 @@ import (
 )
 
 const (
-	projectRepositoryURL = "https://github.com/lichao199208/gptGrok2api"
-	projectVersionURL    = "https://raw.githubusercontent.com/lichao199208/gptGrok2api/main/VERSION"
-	projectChangelogURL  = "https://raw.githubusercontent.com/lichao199208/gptGrok2api/main/CHANGELOG.md"
+	projectRepositoryURL = "https://github.com/1240748922/chatgpt2api-31000"
+	projectVersionURL    = "https://raw.githubusercontent.com/1240748922/chatgpt2api-31000/main/VERSION"
+	projectChangelogURL  = "https://raw.githubusercontent.com/1240748922/chatgpt2api-31000/main/CHANGELOG.md"
 )
 
 func (s *Server) metaUpdate(w http.ResponseWriter, r *http.Request) {
@@ -28,6 +28,19 @@ func (s *Server) metaUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	currentVersion := strings.TrimSpace(s.cfg.Version)
+	// The migration has not been published. Comparing its Go version against
+	// the existing Python release would advertise an unrelated deployment.
+	if strings.HasSuffix(currentVersion, "-go.local") {
+		changelog, _ := os.ReadFile(s.cfg.RelativePath("CHANGELOG.md"))
+		writeJSON(w, http.StatusOK, map[string]any{
+			"current_version": currentVersion, "latest_version": currentVersion,
+			"release_name": currentVersion, "release_url": projectRepositoryURL,
+			"changelog": string(changelog), "release_notes": string(changelog),
+			"runtime": "go", "update_available": false, "status": "local",
+			"check_message": "本地 Go 迁移版尚未发布，更新请以迁移分支为准。",
+		})
+		return
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), 12*time.Second)
 	defer cancel()
 	latestVersion, versionErr := fetchProjectText(ctx, s.requestClient, projectVersionURL, 256)
@@ -139,12 +152,12 @@ func (s *Server) importAccountsAPI(w http.ResponseWriter, r *http.Request) {
 		for _, account := range request.Accounts {
 			accounts = append(accounts, normalizeImportedAccount(account))
 		}
-		added, skipped, items, err := s.store.AddAccounts(request.Tokens, accounts)
+		added, skipped, items, jobID, err := s.addImportedAccounts(r.Context(), request.Tokens, accounts)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error(), "server_error")
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"added": added, "skipped": skipped, "items": accountsForAPI(items)})
+		writeJSON(w, http.StatusOK, map[string]any{"added": added, "skipped": skipped, "items": accountsForAPI(items, s.configuredImageMinimumValidity()), "import_job_id": jobID})
 		return
 	}
 	target, err := url.Parse(strings.TrimSpace(request.URL))
@@ -184,12 +197,12 @@ func (s *Server) importAccountsAPI(w http.ResponseWriter, r *http.Request) {
 	for index := range accounts {
 		accounts[index] = normalizeImportedAccount(accounts[index])
 	}
-	added, skipped, items, err := s.store.AddAccounts(tokens, accounts)
+	added, skipped, items, jobID, err := s.addImportedAccounts(r.Context(), tokens, accounts)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error(), "server_error")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"added": added, "skipped": skipped, "items": accountsForAPI(items)})
+	writeJSON(w, http.StatusOK, map[string]any{"added": added, "skipped": skipped, "items": accountsForAPI(items, s.configuredImageMinimumValidity()), "import_job_id": jobID})
 }
 
 func (s *Server) requireAccountImport(w http.ResponseWriter, r *http.Request) bool {
@@ -214,6 +227,9 @@ func normalizeImportedAccount(account map[string]any) map[string]any {
 	if token := firstNonEmpty(stringValue(result["access_token"]), stringValue(result["accessToken"]), stringValue(result["token"])); token != "" {
 		result["access_token"] = token
 	}
+	if rt := firstNonEmpty(stringValue(result["refresh_token"]), stringValue(result["refreshToken"])); rt != "" {
+		result["refresh_token"] = rt
+	}
 	if password := firstNonEmpty(stringValue(result["login_password"]), stringValue(result["password"]), stringValue(result["account_password"])); password != "" {
 		result["login_password"] = password
 	}
@@ -232,21 +248,24 @@ func normalizeImportedAccount(account map[string]any) map[string]any {
 func importedAccountValues(value any) ([]string, []map[string]any) {
 	tokens := []string{}
 	accounts := []map[string]any{}
-	var walk func(any)
-	walk = func(item any) {
+	var walk func(any, int)
+	walk = func(item any, depth int) {
+		if depth > 12 {
+			return
+		}
 		switch typed := item.(type) {
 		case []any:
 			for _, child := range typed {
-				walk(child)
+				walk(child, depth+1)
 			}
 		case map[string]any:
-			if token := firstNonEmpty(stringValue(typed["access_token"]), stringValue(typed["token"])); token != "" {
+			if token := firstNonEmpty(stringValue(typed["access_token"]), stringValue(typed["accessToken"]), stringValue(typed["token"]), stringValue(typed["refresh_token"]), stringValue(typed["refreshToken"])); token != "" {
 				accounts = append(accounts, typed)
 				return
 			}
-			for _, key := range []string{"items", "accounts", "data", "results"} {
+			for _, key := range []string{"items", "accounts", "data", "results", "credentials"} {
 				if child, ok := typed[key]; ok {
-					walk(child)
+					walk(child, depth+1)
 				}
 			}
 		case string:
@@ -255,7 +274,7 @@ func importedAccountValues(value any) ([]string, []map[string]any) {
 			}
 		}
 	}
-	walk(value)
+	walk(value, 0)
 	return tokens, accounts
 }
 
@@ -267,21 +286,9 @@ func (s *Server) backupTest(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed", "invalid_request_error")
 		return
 	}
-	if err := os.MkdirAll(s.backupDir(), 0o755); err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error(), "server_error")
-		return
-	}
-	file, err := os.CreateTemp(s.backupDir(), ".probe-*")
-	if err == nil {
-		name := file.Name()
-		err = file.Close()
-		_ = os.Remove(name)
-	}
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error(), "server_error")
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "backend": "local", "directory": s.backupDir()})
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+	writeJSON(w, 200, map[string]any{"result": s.testBackup(ctx)})
 }
 
 func (s *Server) imageStorageTest(w http.ResponseWriter, r *http.Request) {
@@ -289,28 +296,55 @@ func (s *Server) imageStorageTest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.Method != http.MethodPost {
-		writeError(w, http.StatusMethodNotAllowed, "method not allowed", "invalid_request_error")
+		writeError(w, 405, "method not allowed", "invalid_request_error")
 		return
 	}
-	for _, directory := range []string{s.cfg.ImageDataDir, s.cfg.VideoDataDir} {
-		if err := os.MkdirAll(directory, 0o755); err != nil {
-			writeError(w, http.StatusInternalServerError, err.Error(), "server_error")
-			return
-		}
+	dav, mode, err := s.webDAV()
+	if err == nil && dav != nil {
+		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+		defer cancel()
+		err = dav.Test(ctx, randomID())
+	} else if err == nil {
+		err = os.MkdirAll(s.cfg.ImageDataDir, 0750)
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "backend": "local"})
+	result := map[string]any{"ok": err == nil, "backend": mode}
+	if err != nil {
+		result["error"] = err.Error()
+	}
+	writeJSON(w, 200, map[string]any{"result": result})
 }
-
 func (s *Server) imageStorageSync(w http.ResponseWriter, r *http.Request) {
 	if !s.requireAdmin(w, r) {
 		return
 	}
 	if r.Method != http.MethodPost {
-		writeError(w, http.StatusMethodNotAllowed, "method not allowed", "invalid_request_error")
+		writeError(w, 405, "method not allowed", "invalid_request_error")
 		return
 	}
-	items := append(listMediaItems(s.cfg.ImageDataDir, "image", ""), listMediaItems(s.cfg.VideoDataDir, "video", "video/")...)
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "synced": len(items), "total_size": mediaItemsSize(items)})
+	dav, _, err := s.webDAV()
+	if err != nil || dav == nil {
+		writeError(w, 400, "请先启用并配置 WebDAV", "storage_not_configured")
+		return
+	}
+	queued, skipped, failed := 0, 0, 0
+	for _, item := range listMediaItems(s.cfg.ImageDataDir, "image", "") {
+		rel := stringValue(item["path"])
+		d, e := s.store.Document(remoteMediaName(rel))
+		if e != nil {
+			failed++
+			continue
+		}
+		if stringValue(d["destination"]) == remoteDestination(dav) && (stringValue(d["status"]) == "done" || stringValue(d["status"]) == "queued") {
+			skipped++
+			continue
+		}
+		if s.queueRemoteImage(rel) != nil {
+			failed++
+		} else {
+			queued++
+		}
+	}
+	writeJSON(w, 200, map[string]any{"result": map[string]any{"queued": queued, "uploaded": 0, "skipped": skipped, "failed": failed}, "message": "后台上传已排队，完成前保留本地图像"})
 }
 
 func (s *Server) proxyProfileByID(w http.ResponseWriter, r *http.Request) {

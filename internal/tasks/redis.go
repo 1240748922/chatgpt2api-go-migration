@@ -18,6 +18,9 @@ import (
 // RESP subset needed by the task lifecycle, so deployments without the Go
 // module cache can still build the service.
 type RedisQueue struct {
+	stop     chan struct{}
+	stopOnce sync.Once
+	workers  sync.WaitGroup
 	addr     string
 	password string
 	database int
@@ -36,7 +39,7 @@ func NewRedis(addr, password string, database int, prefix string) *RedisQueue {
 	if strings.TrimSpace(prefix) == "" {
 		prefix = "gptgrok2api"
 	}
-	return &RedisQueue{addr: addr, password: password, database: database, prefix: prefix, handlers: map[string]func(*Task) (map[string]any, error){}}
+	return &RedisQueue{stop: make(chan struct{}), addr: addr, password: password, database: database, prefix: prefix, handlers: map[string]func(*Task) (map[string]any, error){}}
 }
 
 func (q *RedisQueue) Ping() error {
@@ -58,6 +61,7 @@ func (q *RedisQueue) Start(workers int) {
 	}
 	q.recoverRunning()
 	for i := 0; i < workers; i++ {
+		q.workers.Add(1)
 		go q.worker()
 	}
 }
@@ -134,10 +138,20 @@ func (q *RedisQueue) List() []Task {
 }
 
 func (q *RedisQueue) worker() {
+	defer q.workers.Done()
 	for {
+		select {
+		case <-q.stop:
+			return
+		default:
+		}
 		raw, err := q.command(context.Background(), "BLPOP", q.queueKey(), "5")
 		if err != nil {
-			time.Sleep(time.Second)
+			select {
+			case <-time.After(time.Second):
+			case <-q.stop:
+				return
+			}
 			continue
 		}
 		values, ok := raw.([]any)
@@ -178,6 +192,8 @@ func (q *RedisQueue) worker() {
 		_ = q.save(&current)
 	}
 }
+
+func (q *RedisQueue) Stop() { q.stopOnce.Do(func() { close(q.stop) }); q.workers.Wait() }
 
 func (q *RedisQueue) save(task *Task) error {
 	raw, err := json.Marshal(task)

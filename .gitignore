@@ -23,6 +23,7 @@ docker-compose-local.yml
 # Environment variables
 .env
 .env.local
+.env.go
 
 # Database files
 *.db
@@ -68,3 +69,9 @@ scripts/test_*.py
 scripts/probe_*.py
 scripts/pix_browser_capture.py
 /web/
+
+.local-checks/
+registration-tool/config.json
+registration-tool/runtime/
+registration-tool/sessions/
+registration-tool/**/__pycache__/

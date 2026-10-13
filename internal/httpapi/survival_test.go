@@ -41,6 +41,7 @@ func TestOpenAISurvivalRunUsesRealAccountEndpoints(t *testing.T) {
 		t.Fatal(err)
 	}
 	server := New(cfg)
+	t.Cleanup(func() { _ = server.Close() })
 	token := "survival-token"
 	if _, _, _, err := server.store.AddAccounts(nil, []map[string]any{{"access_token": token, "source_type": "chatgpt_web"}}); err != nil {
 		t.Fatal(err)

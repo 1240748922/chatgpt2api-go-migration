@@ -114,7 +114,9 @@ func TestHealthDoesNotRequireAuthentication(t *testing.T) {
 }
 
 func TestModelsRequireAuthentication(t *testing.T) {
-	handler := New(testConfig()).Handler()
+	handlerServer := New(testConfig())
+	t.Cleanup(func() { _ = handlerServer.Close() })
+	handler := handlerServer.Handler()
 
 	unauthorized := httptest.NewRecorder()
 	handler.ServeHTTP(unauthorized, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
@@ -132,7 +134,9 @@ func TestModelsRequireAuthentication(t *testing.T) {
 }
 
 func TestAuthProtocolUsesBearerHeaderAndSoftStatusProbe(t *testing.T) {
-	handler := New(testConfig()).Handler()
+	handlerServer := New(testConfig())
+	t.Cleanup(func() { _ = handlerServer.Close() })
+	handler := handlerServer.Handler()
 
 	loginRequest := httptest.NewRequest(http.MethodPost, "/auth/login", nil)
 	loginRequest.Header.Set("Authorization", "Bearer admin-secret")
@@ -158,6 +162,7 @@ func TestAccountListDoesNotExposeCredentialTokens(t *testing.T) {
 	cfg.AuthKeysPath = root + "\\auth_keys.json"
 	cfg.ConfigPath = root + "\\config.json"
 	server := New(cfg)
+	t.Cleanup(func() { _ = server.Close() })
 	if _, _, _, err := server.store.AddAccounts(nil, []map[string]any{{
 		"access_token":  "access-secret",
 		"refresh_token": "refresh-secret",

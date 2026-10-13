@@ -54,7 +54,7 @@ export function useSettingsImageStorageRuntime(options: SettingsImageStorageRunt
     imageStorageBusy.value = 'sync'
     try {
       const response = await settingsApi.syncImageStorage()
-      toast.success(`同步完成：上传 ${response.result.uploaded}，跳过 ${response.result.skipped}，失败 ${response.result.failed}`)
+      toast.success(`后台同步已排队 ${response.result.queued ?? response.result.uploaded} 张，跳过 ${response.result.skipped}，失败 ${response.result.failed}`)
     } catch (error) {
       toast.error(errorMessage(error, '同步图片失败'))
     } finally {

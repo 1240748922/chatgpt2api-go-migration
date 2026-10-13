@@ -75,6 +75,7 @@ func TestRefreshProxyGroupSubscriptionPreservesConcurrentAdminChanges(t *testing
 	root := t.TempDir()
 	cfg := adminTestConfig(root)
 	server := New(cfg)
+	t.Cleanup(func() { _ = server.Close() })
 	server.requestClient = upstream.Client()
 	group := map[string]any{
 		"id": "group-one", "name": "Original", "subscription_url": upstream.URL,
@@ -148,6 +149,7 @@ func TestRefreshProxyGroupSubscriptionRecordsFailure(t *testing.T) {
 	root := t.TempDir()
 	cfg := adminTestConfig(root)
 	server := New(cfg)
+	t.Cleanup(func() { _ = server.Close() })
 	server.requestClient = upstream.Client()
 	group := map[string]any{
 		"id": "group-failure", "subscription_url": upstream.URL,
@@ -175,6 +177,7 @@ func TestRefreshProxyGroupSubscriptionRecordsFailure(t *testing.T) {
 func TestRuntimeFailuresRemoveAndBlacklistSubscriptionNode(t *testing.T) {
 	root := t.TempDir()
 	server := New(adminTestConfig(root))
+	t.Cleanup(func() { _ = server.Close() })
 	removedURL := "http://removed.example:8080"
 	group := map[string]any{
 		"id": "images", "subscription_url": "https://subscription.example/list",

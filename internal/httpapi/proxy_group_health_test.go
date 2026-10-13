@@ -16,6 +16,7 @@ func TestProxyGroupTestPersistsEachNodeAndKeepsHTTP403ForAPIVerification(t *test
 		t.Fatal(err)
 	}
 	server := New(cfg)
+	t.Cleanup(func() { _ = server.Close() })
 	server.proxyProbeURL = "http://health.test/probe"
 
 	availableProxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

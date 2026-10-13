@@ -130,25 +130,12 @@ func (s *Server) streamOpenAIChat(w http.ResponseWriter, r *http.Request, reques
 
 func (s *Server) completeOpenAIImageChat(w http.ResponseWriter, r *http.Request, request protocol.ChatRequest) {
 	started := time.Now()
-	imageContext, cancelImageRequest := context.WithTimeout(r.Context(), imageRequestTotalTimeout(s.cfg.RequestTimeout))
-	defer cancelImageRequest()
-	releaseSlot, err := s.acquireImageSlot(imageContext, r)
-	if err != nil {
-		writeOpenAIChatError(w, err)
-		return
-	}
-	defer releaseSlot()
-	imageContext = s.monitorOpenAIImageContext(r, imageContext)
 	s.enrichRequestMonitor(r, map[string]any{"model": request.Model})
 	prompt := protocol.ExtractMessage(request.Messages)
 	if strings.TrimSpace(prompt) == "" {
 		writeError(w, http.StatusBadRequest, "messages contain no text", "invalid_request_error")
 		return
 	}
-	excluded := map[string]bool{}
-	var images []provider.ImageResult
-	var selected accounts.Account
-	var lastErr error
 	inputStarted := time.Now()
 	inputs := make([]provider.OpenAIImageInput, 0)
 	for _, message := range request.Messages {
@@ -175,54 +162,16 @@ func (s *Server) completeOpenAIImageChat(w http.ResponseWriter, r *http.Request,
 		size = "1024x1024"
 	}
 	s.enrichRequestMonitor(r, map[string]any{"size": size, "image_url_parts": len(inputs), "data_url_images": len(inputs)})
-	s.stageRequestMonitor(r, "image_egress_waiting", 30, map[string]any{"egress_wait_ms": 0})
-	s.stageRequestMonitor(r, "image_getting_account", 35, nil)
-	for attempt := 0; attempt <= s.cfg.ChatMaxRetries; attempt++ {
-		accountStarted := time.Now()
-		lease, err := s.accountPool.ReserveMatchingLimit(r.Context(), []string{"basic", "super", "heavy"}, excluded, isOpenAIAccount, s.cfg.ImageAccountLimit)
-		if err != nil {
-			lastErr = err
-			break
-		}
-		s.enrichMonitorAccount(r, lease.Account)
-		s.stageRequestMonitor(r, "image_getting_account", 35, map[string]any{"account_wait_ms": time.Since(accountStarted).Milliseconds()})
-		images, err = s.openAIImage.Generate(imageContext, lease.Account, prompt, request.Model, size, "auto", inputs)
-		selected = lease.Account
-		s.accountPool.Release(lease)
-		if err != nil {
-			s.accountPool.Feedback(lease.Account, upstreamStatus(err), err)
-			excluded[lease.Account.Token] = true
-			lastErr = err
-			if s.shouldRetry(upstreamStatus(err), attempt) {
-				continue
-			}
-			break
-		}
-		s.accountPool.Feedback(lease.Account, http.StatusOK, nil)
-		lastErr = nil
-		break
-	}
-	s.stageRequestMonitor(r, "image_stream_resolve_start", 80, nil)
-	if lastErr != nil {
-		writeOpenAIChatError(w, lastErr)
+	data, err := s.generateOpenAIImageData(r, r.Context(), prompt, request.Model, size, "auto", inputs, "url", requestPublicBase(r), 1)
+	if err != nil {
+		s.writeImageError(w, r, err)
 		return
 	}
-	parts := make([]string, 0, len(images))
-	for _, image := range images {
-		item, localURL, resolveErr := s.openAIImage.Resolve(r.Context(), selected, image, "url", s.cfg.ImageDataDir, requestPublicBase(r))
-		if resolveErr != nil {
-			s.accountPool.Feedback(selected, upstreamStatus(resolveErr), resolveErr)
-			writeError(w, upstreamStatus(resolveErr), resolveErr.Error(), "upstream_error")
-			return
-		}
-		s.recordGeneratedMedia(r.Context(), map[string]string{"url": localURL})
+	parts := make([]string, 0, len(data))
+	for _, item := range data {
 		parts = append(parts, fmt.Sprintf("![image](%s)", item["url"]))
-		// Chat image requests have no image-count parameter and return one
-		// assistant image. Do not persist extra upstream references.
-		break
 	}
 	s.stageRequestMonitor(r, "image_download_done", 95, map[string]any{"total_ms": time.Since(started).Milliseconds()})
-	s.accountPool.Feedback(selected, http.StatusOK, nil)
 	content := strings.Join(parts, "\n")
 	writeJSON(w, http.StatusOK, map[string]any{
 		"id": newChatID(), "object": "chat.completion", "created": time.Now().Unix(), "model": request.Model,
@@ -271,6 +220,7 @@ func (s *Server) streamOpenAIImageChat(w http.ResponseWriter, r *http.Request, r
 	request.Stream = false
 	s.completeOpenAIImageChat(recorder, r, request)
 	if recorder.status >= 400 {
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(recorder.status)
 		_, _ = w.Write(recorder.body.Bytes())
 		return

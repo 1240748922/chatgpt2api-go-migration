@@ -24,6 +24,9 @@ type Task struct {
 }
 
 type Queue struct {
+	stop     chan struct{}
+	stopOnce sync.Once
+	workers  sync.WaitGroup
 	path     string
 	mu       sync.Mutex
 	items    map[string]*Task
@@ -32,6 +35,7 @@ type Queue struct {
 }
 
 type QueueAPI interface {
+	Stop()
 	Register(string, func(*Task) (map[string]any, error))
 	Start(int)
 	Submit(string, map[string]any) *Task
@@ -41,7 +45,7 @@ type QueueAPI interface {
 }
 
 func New(path string) *Queue {
-	q := &Queue{path: path, items: map[string]*Task{}, wake: make(chan struct{}, 1), handlers: map[string]func(*Task) (map[string]any, error){}}
+	q := &Queue{stop: make(chan struct{}), path: path, items: map[string]*Task{}, wake: make(chan struct{}, 1), handlers: map[string]func(*Task) (map[string]any, error){}}
 	_ = q.load()
 	return q
 }
@@ -58,6 +62,7 @@ func (q *Queue) Start(workers int) {
 		workers = 1
 	}
 	for index := 0; index < workers; index++ {
+		q.workers.Add(1)
 		go q.worker()
 	}
 	q.signal()
@@ -111,7 +116,13 @@ func (q *Queue) List() []Task {
 }
 
 func (q *Queue) worker() {
+	defer q.workers.Done()
 	for {
+		select {
+		case <-q.stop:
+			return
+		default:
+		}
 		q.mu.Lock()
 		var selected *Task
 		for _, task := range q.items {
@@ -134,7 +145,11 @@ func (q *Queue) worker() {
 		}
 		q.mu.Unlock()
 		if selected == nil {
-			<-q.wake
+			select {
+			case <-q.wake:
+			case <-q.stop:
+				return
+			}
 			continue
 		}
 		result, err := handler(selected)
@@ -154,6 +169,8 @@ func (q *Queue) worker() {
 		q.mu.Unlock()
 	}
 }
+
+func (q *Queue) Stop() { q.stopOnce.Do(func() { close(q.stop) }); q.workers.Wait() }
 
 func (q *Queue) signal() {
 	select {

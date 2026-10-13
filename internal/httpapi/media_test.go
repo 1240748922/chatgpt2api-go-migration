@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/auucoder/gptgrok2api-go/internal/auth"
 	"github.com/auucoder/gptgrok2api-go/internal/config"
 	"github.com/auucoder/gptgrok2api-go/internal/protocol"
 	"github.com/auucoder/gptgrok2api-go/internal/provider"
@@ -193,7 +194,7 @@ func TestEditableFileDownloadRequiresValidSignature(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(fileRoot, "result.zip"), []byte("payload"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	server := &Server{cfg: config.Config{DataDir: root, APIKey: "api-secret"}}
+	server := &Server{cfg: config.Config{DataDir: root, APIKey: "api-secret"}, auth: auth.New("api-secret", "", "", false, nil)}
 	unsigned := httptest.NewRequest(http.MethodGet, "/files/result.zip", nil)
 	unsignedResponse := httptest.NewRecorder()
 	server.downloadEditableFile(unsignedResponse, unsigned)
@@ -259,9 +260,11 @@ func TestImageGenerationsRunsOpenAIBatchesConcurrently(t *testing.T) {
 	cfg.ImageDataDir = root + "\\images"
 
 	server := New(cfg)
+
+	t.Cleanup(func() { _ = server.Close() })
 	if _, _, _, err := server.store.AddAccounts(nil, []map[string]any{
-		{"access_token": "jwt.header.payload", "email": "a@example.test", "pool": "basic"},
-		{"access_token": "jwt.header.payload2", "email": "b@example.test", "pool": "basic"},
+		{"access_token": migrationTestJWT("a"), "email": "a@example.test", "pool": "basic"},
+		{"access_token": migrationTestJWT("b"), "email": "b@example.test", "pool": "basic"},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -351,8 +354,10 @@ func TestOpenAIImageRequestsPersistOnlyReturnedImageCount(t *testing.T) {
 	cfg.ImageDataDir = filepath.Join(root, "images")
 
 	server := New(cfg)
+
+	t.Cleanup(func() { _ = server.Close() })
 	if _, _, _, err := server.store.AddAccounts(nil, []map[string]any{
-		{"access_token": "jwt.header.payload", "email": "a@example.test", "pool": "basic"},
+		{"access_token": migrationTestJWT("a"), "email": "a@example.test", "pool": "basic"},
 	}); err != nil {
 		t.Fatal(err)
 	}

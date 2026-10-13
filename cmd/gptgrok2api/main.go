@@ -21,7 +21,11 @@ func main() {
 	if err != nil {
 		log.Fatalf("load config: %v", err)
 	}
-	logFile, logErr := os.OpenFile(filepath.Join(cfg.RootDir, "logs", "app.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	logDir := filepath.Join(cfg.RootDir, "logs")
+	if err := os.MkdirAll(logDir, 0o700); err != nil {
+		log.Printf("create runtime log directory: %v", err)
+	}
+	logFile, logErr := os.OpenFile(filepath.Join(logDir, "app.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if logErr == nil {
 		defer logFile.Close()
 		log.SetOutput(io.MultiWriter(os.Stdout, logFile))
@@ -29,9 +33,11 @@ func main() {
 		log.Printf("open runtime log: %v", logErr)
 	}
 
+	app := httpapi.New(cfg)
+	defer app.Close()
 	server := &http.Server{
 		Addr:                         cfg.ListenAddr,
-		Handler:                      httpapi.New(cfg).Handler(),
+		Handler:                      app.Handler(),
 		ReadHeaderTimeout:            10 * time.Second,
 		ReadTimeout:                  cfg.RequestTimeout,
 		WriteTimeout:                 0,

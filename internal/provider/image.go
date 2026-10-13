@@ -14,13 +14,19 @@ import (
 	"time"
 
 	"github.com/auucoder/gptgrok2api-go/internal/accounts"
+	"github.com/auucoder/gptgrok2api-go/internal/mediafile"
 	"github.com/auucoder/gptgrok2api-go/internal/protocol"
 )
 
 type ImageResult struct {
-	URL    string
-	Base64 string
-	MIME   string
+ ConversationID string
+	URL          string
+	Base64       string
+	MIME         string
+	OutputSize   string
+	OutputEngine string
+	ProcessorURL string
+	DeliveryID   string
 }
 
 func (m *Media) GenerateLite(ctx context.Context, account accounts.Account, prompt, mode string, count int) ([]ImageResult, error) {
@@ -95,7 +101,7 @@ func (m *Media) ResolveImage(ctx context.Context, account accounts.Account, imag
 	}
 	ext := extensionForMIME(mime)
 	path := filepath.Join(imageDir, fileID+ext)
-	if err := os.WriteFile(path, raw, 0o644); err != nil {
+	if err := mediafile.AtomicWrite(path, raw, 0o640); err != nil {
 		return nil, err
 	}
 	base := strings.TrimRight(publicBase, "/")

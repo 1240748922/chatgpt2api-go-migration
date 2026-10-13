@@ -1,7 +1,6 @@
 package httpapi
 
 import (
-	"log"
 	"time"
 
 	proxyruntime "github.com/auucoder/gptgrok2api-go/internal/proxy"
@@ -72,10 +71,10 @@ func (s *Server) persistProxyGroupRuntimeResult(event proxyruntime.ImageNodeRunt
 		return groups, nil
 	})
 	if err != nil {
-		log.Printf("persist proxy node runtime result failed: %v", err)
+		s.runtimeLog("warning", "persist proxy node runtime result failed: %v", err)
 		return
 	}
 	if event.Removed {
-		log.Printf("removed proxy group node after %d runtime failures: group=%s node=%s", event.Failures, event.GroupID, event.NodeID)
+		s.runtimeLog("warning", "removed proxy group node after %d runtime failures: group=%s node=%s", event.Failures, event.GroupID, event.NodeID)
 	}
 }

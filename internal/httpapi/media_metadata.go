@@ -3,15 +3,13 @@ package httpapi
 import (
 	"context"
 	"encoding/json"
+	"github.com/auucoder/gptgrok2api-go/internal/mediafile"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 )
-
-var generatedMediaMetaMu sync.Mutex
 
 func (s *Server) recordGeneratedMedia(ctx context.Context, result map[string]string) {
 	rawURL := strings.TrimSpace(result["url"])
@@ -26,12 +24,19 @@ func (s *Server) recordGeneratedMedia(ctx context.Context, result map[string]str
 	if id == "" {
 		id = strings.TrimSuffix(filepath.Base(parsed.Path), filepath.Ext(parsed.Path))
 	}
-	entries, _ := os.ReadDir(s.cfg.ImageDataDir)
 	filename := ""
-	for _, entry := range entries {
-		if !entry.IsDir() && strings.HasPrefix(entry.Name(), id+".") && !strings.HasSuffix(entry.Name(), ".meta.json") {
-			filename = entry.Name()
-			break
+	candidate := filepath.Base(parsed.Path)
+	if isImageStorageFile(candidate) && candidate != "." {
+		if info, e := os.Lstat(filepath.Join(s.cfg.ImageDataDir, candidate)); e == nil && info.Mode().IsRegular() {
+			filename = candidate
+		}
+	}
+	if filename == "" {
+		for _, ext := range []string{".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"} {
+			if info, e := os.Lstat(filepath.Join(s.cfg.ImageDataDir, id+ext)); e == nil && info.Mode().IsRegular() {
+				filename = id + ext
+				break
+			}
 		}
 	}
 	if filename == "" {
@@ -47,9 +52,17 @@ func (s *Server) recordGeneratedMedia(ctx context.Context, result map[string]str
 	}
 	meta := map[string]any{"call_id": callID, "endpoint": endpoint, "model": model, "generated_at": time.Now().UTC().Format(time.RFC3339), "source_type": "generated_output", "role": "output"}
 	b, _ := json.Marshal(meta)
-	generatedMediaMetaMu.Lock()
-	defer generatedMediaMetaMu.Unlock()
-	_ = os.WriteFile(filepath.Join(s.cfg.ImageDataDir, filename+".meta.json"), b, 0o600)
+	_ = mediafile.AtomicWrite(filepath.Join(s.cfg.ImageDataDir, filename+".meta.json"), b, 0o600)
+	if err := s.queueRemoteImage(filename); err != nil {
+		s.runtimeLog("warning", "remote image enqueue failed; local image retained: %v", err)
+	}
+	if _, studio := ctx.Value(imageTaskOwnerKey{}).(string); studio {
+		if cfg, e := s.store.Config(); e == nil && boolValue(mapValue(cfg["genbox_push"])["enabled"], false) {
+			if e := s.queueGenbox(filename, true); e != nil {
+				s.runtimeLog("warning", "GenBox enqueue failed; source image retained: %v", e)
+			}
+		}
+	}
 }
 
 func mediaMetadata(path string) map[string]any {

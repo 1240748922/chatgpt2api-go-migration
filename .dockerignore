@@ -2,6 +2,11 @@
 .gitignore
 .env
 .env.*
+!.env.go.example
+.local-checks
+registration-tool/runtime
+registration-tool/sessions
+registration-tool/config.json
 config.json
 data
 .idea
@@ -22,6 +27,8 @@ web
 web-vue/dist
 web-vue/node_modules
 node_modules
+**/node_modules
+**/__pycache__
 web_dist
 
 assets
