@@ -1,5 +1,11 @@
 # Changelog
 
+## 3.3.1-go.local - 2026-10-14
+
++ [新增] Session JSON 可粘贴或读取本地 JSON 文件，确认内容后提交；支持 `accessToken`、`auth_session`、`tokens` 和 `response.session` 结构，并保留可用于账号恢复的身份字段。
++ [修复] 注册机导出的邮箱 `mailbox.refresh_token` 不再被误判为 OpenAI Refresh Token。
++ [优化] Compose 默认单 `app` 实例，使用 `--scale app=N` 按需扩容；网关通过 Docker DNS 动态发现副本，不再固定 8 个应用容器。
+
 ## 3.3.0-go.local - 2026-10-14
 
 + [迁移] Chatgpt 生图系统改用 Go 后端，保留账号导入、续期、额度、后台维护、页面预热、图片任务、注册机和存储功能。

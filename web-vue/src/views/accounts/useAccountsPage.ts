@@ -370,6 +370,7 @@ export function useAccountsPage() {
   const importManualTokenText = accountImport.importManualTokenText
   const importTokenTextFile = accountImport.importTokenTextFile
   const importSessionJson = accountImport.importSessionJson
+  const loadSessionJsonFile = accountImport.loadSessionJsonFile
   const startOAuthLogin = accountImport.startOAuthLogin
   const openOAuthAuthorizeUrl = accountImport.openOAuthAuthorizeUrl
   const copyOAuthAuthorizeUrl = accountImport.copyOAuthAuthorizeUrl
@@ -517,6 +518,7 @@ export function useAccountsPage() {
     importManualTokenText,
     importTokenTextFile,
     importSessionJson,
+    loadSessionJsonFile,
     startOAuthLogin,
     openOAuthAuthorizeUrl,
     copyOAuthAuthorizeUrl,

@@ -952,7 +952,10 @@
                     description="从 chatgpt.com 的 session 接口复制完整 JSON，自动提取 accessToken。"
                   />
                   <textarea v-model.trim="sessionJsonText" rows="12" class="ui-textarea-sm font-mono" placeholder="粘贴完整 session JSON"></textarea>
-                  <div class="flex justify-end">
+                  <div class="flex flex-wrap justify-end gap-2">
+                    <Button size="xs" variant="outline" :disabled="importBusy || importRunning" @click="openSessionJsonFile">
+                      读取 JSON 文件
+                    </Button>
                     <Button size="xs" variant="primary" :disabled="importBusy || importRunning || !sessionJsonText.trim()" @click="importSessionJson">
                       {{ importBusy ? '导入中...' : '开始导入' }}
                     </Button>
@@ -1028,6 +1031,7 @@
     </ModalShell>
 
     <input ref="manualTokenFileInputRef" type="file" accept=".txt,.json,.jsonl,text/plain,application/json" class="hidden" @change="handleManualTokenFileChange" />
+    <input ref="sessionJsonFileInputRef" type="file" accept=".json,application/json" class="hidden" @change="handleSessionJsonFileChange" />
     <input ref="cpaFileInputRef" type="file" accept=".json,application/json" multiple class="hidden" @change="handleCPAFileChange" />
   </div>
 </template>
@@ -1226,6 +1230,7 @@ const {
   importManualTokenText,
   importTokenTextFile,
   importSessionJson,
+  loadSessionJsonFile,
   startOAuthLogin,
   openOAuthAuthorizeUrl,
   copyOAuthAuthorizeUrl,
@@ -1605,6 +1610,7 @@ function openGrokLoginCredentials(item: GrokAccount) {
 }
 
 const manualTokenFileInputRef = ref<HTMLInputElement | null>(null)
+const sessionJsonFileInputRef = ref<HTMLInputElement | null>(null)
 const cpaFileInputRef = ref<HTMLInputElement | null>(null)
 const remoteImportBusy = ref(false)
 const accountToolbarMenuClass = 'shrink-0 whitespace-nowrap'
@@ -1665,6 +1671,18 @@ async function handleManualTokenFileChange(event: Event) {
   const target = event.target as HTMLInputElement | null
   const file = target?.files?.[0]
   await importTokenTextFile(file)
+  if (target) target.value = ''
+}
+
+function openSessionJsonFile() {
+  if (!sessionJsonFileInputRef.value || importBusy.value || importRunning.value) return
+  sessionJsonFileInputRef.value.value = ''
+  sessionJsonFileInputRef.value.click()
+}
+
+async function handleSessionJsonFileChange(event: Event) {
+  const target = event.target as HTMLInputElement | null
+  await loadSessionJsonFile(target?.files?.[0])
   if (target) target.value = ''
 }
 

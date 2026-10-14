@@ -2,8 +2,10 @@ package httpapi
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -17,6 +19,29 @@ func importTestServer(t *testing.T) *Server {
 	t.Cleanup(func() { _ = st.Close() })
 	return &Server{store: st, backgroundCtx: context.Background()}
 }
+
+func TestSessionJSONImportEndpointQueuesParsedCredentials(t *testing.T) {
+	s := New(adminTestConfig(t.TempDir()))
+	defer s.Close()
+	request := `{"mode":"session_json","text":"{\"auth_session\":{\"accessToken\":\"session-at\",\"refreshToken\":\"session-rt\"},\"user\":{\"email\":\"session@example.test\"},\"proxy\":\"http://discard.invalid\"}"}`
+	response := adminRequest(s.Handler(), "POST", "/api/account-import-jobs", strings.NewReader(request))
+	if response.Code != 202 {
+		t.Fatalf("session job not queued: %d %s", response.Code, response.Body.String())
+	}
+	var job map[string]any
+	if err := json.Unmarshal(response.Body.Bytes(), &job); err != nil {
+		t.Fatal(err)
+	}
+	chunk, err := s.store.Document(importChunk(stringValue(job["id"]), 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := importRows(chunk["accounts"])
+	if len(rows) != 1 || stringValue(rows[0]["access_token"]) != "session-at" || stringValue(rows[0]["refresh_token"]) != "session-rt" || stringValue(rows[0]["email"]) != "session@example.test" || rows[0]["proxy"] != nil {
+		t.Fatalf("session credentials not normalized: %#v", rows)
+	}
+}
+
 func TestImportProgressReconcilesRestartAndStablePagination(t *testing.T) {
 	s := importTestServer(t)
 	rows := []map[string]any{}

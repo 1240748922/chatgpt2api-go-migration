@@ -30,25 +30,55 @@ func Parse(text, mode string) ([]map[string]any, error) {
 				walk(child, depth+1)
 			}
 		case map[string]any:
-			at := value(x, "access_token", "accessToken")
-			rt := value(x, "refresh_token", "refreshToken")
+			response := object(x["response"])
+			auth := object(x["auth_session"])
+			if auth == nil {
+				auth = object(response["auth_session"])
+			}
+			session := object(response["session"])
+			tokens := object(x["tokens"])
+			at := first(value(x, "access_token", "accessToken"), value(auth, "accessToken", "access_token"), value(response, "access_token", "accessToken"), value(session, "access_token", "accessToken"), value(tokens, "access_token", "accessToken"))
+			// Registration exports may use refresh_token for the mailbox. Only
+			// oauth_refresh_token/auth_session is an OpenAI RT in that format.
+			rt := first(value(x, "oauth_refresh_token"), value(auth, "refreshToken", "refresh_token"), value(tokens, "refresh_token", "refreshToken"))
+			registration := x["mailbox"] != nil || x["oauth_refresh_token"] != nil || x["refresh_token_status"] != nil
+			if rt == "" && !registration {
+				rt = first(value(x, "refresh_token", "refreshToken"), value(response, "refresh_token", "refreshToken"), value(session, "refresh_token", "refreshToken"))
+			}
 			if at != "" || rt != "" {
 				p := map[string]any{"access_token": at, "refresh_token": rt, "source_type": "chatgpt_web", "image_quota_unknown": true}
 				if strings.EqualFold(value(x, "source_type", "export_type"), "codex") || strings.EqualFold(value(x, "type"), "codex") {
 					p["source_type"] = "codex"
 				}
-				for _, key := range []string{"email", "type", "plan_type", "id_token", "oauth_client_id"} {
+				for _, key := range []string{"email", "type", "plan_type", "oauth_client_id"} {
 					if t := value(x, key); t != "" && !(key == "type" && strings.EqualFold(t, "codex")) {
 						p[key] = t
 					}
 				}
-				if u, ok := x["user"].(map[string]any); ok && value(p, "email") == "" {
-					p["email"] = value(u, "email")
+				if email := first(value(p, "email"), value(object(x["user"]), "email"), value(object(auth["user"]), "email"), value(object(response["user"]), "email"), value(object(session["user"]), "email"), value(object(x["mailbox"]), "email")); email != "" {
+					p["email"] = email
+				}
+				for key, credential := range map[string]string{
+					"id_token":          first(value(x, "id_token", "idToken"), value(auth, "idToken", "id_token")),
+					"login_password":    value(x, "login_password", "password", "account_password"),
+					"two_factor_secret": value(x, "two_factor_secret", "totp_secret", "two_fa", "2fa_secret"),
+					"session_token":     first(value(x, "session_token", "sessionToken"), value(auth, "sessionToken", "session_token")),
+					"cookie_header":     first(value(x, "cookie_header"), value(response, "cookie_header")),
+				} {
+					if credential != "" {
+						p[key] = credential
+					}
+				}
+				if value(p, "cookie_header") == "" && value(p, "session_token") != "" {
+					p["cookie_header"] = "__Secure-next-auth.session-token=" + value(p, "session_token")
 				}
 				rows = append(rows, p)
 				return
 			}
-			for _, key := range []string{"accounts", "items", "data", "results", "credentials"} {
+			if registration {
+				return // Never import an unrelated mailbox credential as an account.
+			}
+			for _, key := range []string{"accounts", "items", "data", "results", "credentials", "auth_session", "tokens", "response", "session"} {
 				if child, ok := x[key]; ok {
 					walk(child, depth+1)
 				}
@@ -67,6 +97,9 @@ func Parse(text, mode string) ([]map[string]any, error) {
 			walk(v, 0)
 		}
 	} else {
+		if mode == "session_json" {
+			return nil, errors.New("Session 导入需要有效的 JSON 内容")
+		}
 		for _, line := range strings.Split(text, "\n") {
 			line = strings.TrimSpace(line)
 			if line == "" || strings.HasPrefix(line, "#") {
@@ -119,6 +152,20 @@ func value(m map[string]any, keys ...string) string {
 	for _, key := range keys {
 		if v, ok := m[key].(string); ok && strings.TrimSpace(v) != "" {
 			return strings.TrimSpace(v)
+		}
+	}
+	return ""
+}
+
+func object(v any) map[string]any {
+	m, _ := v.(map[string]any)
+	return m
+}
+
+func first(values ...string) string {
+	for _, v := range values {
+		if v != "" {
+			return v
 		}
 	}
 	return ""

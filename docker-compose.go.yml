@@ -77,14 +77,10 @@ services:
       interval: 5s
       timeout: 3s
       retries: 20
-  app0: *app
-  app1: *app
-  app2: *app
-  app3: *app
-  app4: *app
-  app5: *app
-  app6: *app
-  app7: *app
+  # Keep one application service by default. Compose can add replicas without
+  # changing the gateway or the shared PostgreSQL-backed account state:
+  #   docker compose --env-file .env.go -f docker-compose.go.yml up -d --scale app=4
+  app: *app
   registrar:
     <<: *app
     image: ${CHATGPT_GO_REGISTRAR_IMAGE:-chatgpt-images-go-registrar:local}
@@ -108,21 +104,7 @@ services:
     image: nginx:1.29-alpine
     restart: unless-stopped
     depends_on:
-      app0:
-        condition: service_healthy
-      app1:
-        condition: service_healthy
-      app2:
-        condition: service_healthy
-      app3:
-        condition: service_healthy
-      app4:
-        condition: service_healthy
-      app5:
-        condition: service_healthy
-      app6:
-        condition: service_healthy
-      app7:
+      app:
         condition: service_healthy
     ports:
       - "${CHATGPT_GO_PORT:-31001}:80"

@@ -83,11 +83,11 @@ export function useAccountImportRuntime(options: AccountImportRuntimeOptions) {
     if (running) { importMinimized.value = true; selectImportJob(running) }
   })
   onBeforeUnmount(() => { stopped = true; if (timer) clearTimeout(timer) })
-  async function startImport(rows: ImportedCredential[]) {
+  async function submitImport(payload: Record<string, unknown>) {
     if (importBusy.value || importRunning.value) return
     importBusy.value = true
     try {
-      importJob.value = await importJobsApi.start({ accounts: rows })
+      importJob.value = await importJobsApi.start(payload)
       manualTokenText.value = ''
       sessionJsonText.value = ''
       parsedFileRows = []
@@ -98,6 +98,7 @@ export function useAccountImportRuntime(options: AccountImportRuntimeOptions) {
     } catch (error) { options.setError('提交导入任务失败', error) }
     finally { importBusy.value = false }
   }
+  async function startImport(rows: ImportedCredential[]) { await submitImport({ accounts: rows }) }
   async function importManualTokenText() {
     try {
       const rows = parsedFileRows.length && manualTokenText.value === parsedFilePreview
@@ -117,8 +118,20 @@ export function useAccountImportRuntime(options: AccountImportRuntimeOptions) {
     } catch (error) { options.setError('读取文件失败', error) }
   }
   async function importSessionJson() {
-    try { await startImport(parseAccountCredentials(sessionJsonText.value)) }
-    catch (error) { options.setError('识别 JSON 失败', error) }
+    const text = sessionJsonText.value.trim()
+    if (!text) { toast.warning('请先粘贴 Session JSON'); return }
+    await submitImport({ text, mode: 'session_json' })
+  }
+  async function loadSessionJsonFile(file: File | null | undefined) {
+    if (!file) return
+    sessionJsonText.value = ''
+    try {
+      if (file.size > 16 * 1024 * 1024) throw new Error('Session JSON 文件不能超过 16 MB')
+      const text = (await file.text()).trim()
+      JSON.parse(text)
+      sessionJsonText.value = text
+      toast.success('已读取 Session JSON，请确认后点击开始导入')
+    } catch (error) { options.setError('读取 Session JSON 失败', error) }
   }
   async function importLocalCPAFiles(files: FileList | File[] | null | undefined) {
     try {
@@ -215,7 +228,7 @@ export function useAccountImportRuntime(options: AccountImportRuntimeOptions) {
     importJob, importJobs, importMonitorError, importRunning, selectImportJob, minimizeImportModal,
     oauthEmailHint, oauthCallbackText, oauthSessionId, oauthAuthorizeUrl, oauthRedirectUriPrefix,
     manualTokenText, sessionJsonText, setImportMode, openImportModal, closeImportModal,
-    importManualTokenText, importTokenTextFile, importSessionJson, importLocalCPAFiles,
+    importManualTokenText, importTokenTextFile, importSessionJson, loadSessionJsonFile, importLocalCPAFiles,
     startOAuthLogin, openOAuthAuthorizeUrl, copyOAuthAuthorizeUrl, finishOAuthLogin,
   }
 }
