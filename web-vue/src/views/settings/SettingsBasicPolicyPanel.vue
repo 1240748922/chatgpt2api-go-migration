@@ -18,9 +18,26 @@
     </FormSection>
 
     <FormSection title="图片超分">
-      <Checkbox v-model="settings.image_upscale_enabled">按请求尺寸放大图片</Checkbox>
-      <FormField label="处理引擎"><select v-model="settings.image_upscale_engine" class="ui-input w-full"><option value="go">Go（无需额外服务）</option><option value="sharp">Sharp</option><option value="pillow">Pillow</option><option value="fsrcnn">FSRCNN</option></select></FormField>
-      <p class="text-xs text-muted-foreground">Sharp、Pillow 和 FSRCNN 需启动图片处理服务；Go 使用本地插值。</p>
+      <div class="settings-check-grid settings-check-grid--single">
+        <div class="settings-check-item">
+          <div class="settings-check-control">
+            <Checkbox v-model="settings.image_upscale_enabled">按请求尺寸放大图片</Checkbox>
+            <HelpTip text="仅在图片小于请求尺寸时放大；关闭后返回上游原图。插值放大不代表重新生成更多细节。" />
+          </div>
+        </div>
+      </div>
+      <FormField label="处理引擎">
+        <div class="w-full">
+          <GroupedSelectMenu
+            v-model="selectedEngine"
+            :options="imageUpscaleEngineOptions"
+            :disabled="!settings.image_upscale_enabled"
+            aria-label="图片超分处理引擎"
+            block
+          />
+        </div>
+      </FormField>
+      <p class="text-xs leading-relaxed text-muted-foreground">{{ imageUpscaleEngineHints[selectedEngine] }}</p>
     </FormSection>
 
     <FormSection title="图片确认">
@@ -73,15 +90,25 @@
 </template>
 
 <script setup lang="ts">
+import { computed } from 'vue'
 import { Checkbox, FormField, FormSection, HelpTip, Input } from 'nanocat-ui'
+import GroupedSelectMenu from '@/components/ui/GroupedSelectMenu.vue'
+import { imageUpscaleEngineHints, imageUpscaleEngineOptions, normalizeImageUpscaleEngine } from '@/lib/imageUpscale'
 import type { Settings } from '@/types/api'
 import { logLevelOptions } from '@/views/settings/settingsView'
 import type { NumberSettingField } from '@/views/settings/useNumberSettingField'
 
-defineProps<{
+const props = defineProps<{
   settings: Settings
   imageSettleSecondsField: NumberSettingField
 }>()
+
+const selectedEngine = computed({
+  get: () => normalizeImageUpscaleEngine(props.settings.image_upscale_engine),
+  set: (value: string | string[]) => {
+    props.settings.image_upscale_engine = normalizeImageUpscaleEngine(value)
+  },
+})
 
 defineEmits<{
   setLogLevel: [level: string, enabled: boolean]

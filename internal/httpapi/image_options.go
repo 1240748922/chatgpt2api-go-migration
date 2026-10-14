@@ -3,10 +3,12 @@ package httpapi
 import (
 	"context"
 	"encoding/json"
-	"github.com/auucoder/gptgrok2api-go/internal/provider"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/auucoder/gptgrok2api-go/internal/mediafile"
+	"github.com/auucoder/gptgrok2api-go/internal/provider"
 )
 
 // OpenAI images preserve the Python API default and explicit response_format.
@@ -99,6 +101,11 @@ func (s *Server) imageOptionsContext(ctx context.Context) (context.Context, erro
 	}
 	if !boolValue(mapValue(cfg["image_generation"])["enabled"], true) {
 		return ctx, &imageSettingsError{503, "image_generation_disabled", "Image generation is disabled."}
+	}
+	if boolValue(cfg["image_upscale_enabled"], false) {
+		if _, err := mediafile.NormalizeUpscaleEngine(stringValue(cfg["image_upscale_engine"])); err != nil {
+			return ctx, &imageSettingsError{400, "invalid_image_upscale_engine", err.Error()}
+		}
 	}
 	settle := time.Duration(0)
 	if boolValue(cfg["image_settle_enabled"], true) {

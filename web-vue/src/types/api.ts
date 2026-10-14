@@ -86,7 +86,7 @@ export interface Settings {
   image_settle_secs?: number
   image_timeout_retry_secs?: number
   image_upscale_enabled?: boolean
-  image_upscale_engine?: 'go' | 'sharp' | 'pillow' | 'fsrcnn'
+  image_upscale_engine?: import('@/lib/imageUpscale').ImageUpscaleEngine
   genbox_push: { enabled: boolean; base_url: string; source_id: string; push_key: string; has_push_key?: boolean; timeout_secs: number; auto_push_after_studio: boolean }
   auto_remove_invalid_accounts?: boolean
   auto_remove_rate_limited_accounts?: boolean

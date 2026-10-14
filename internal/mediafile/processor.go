@@ -12,6 +12,23 @@ import (
 	"time"
 )
 
+// NormalizeUpscaleEngine accepts names previously saved by the dashboard as
+// well as the processor's canonical names. The built-in engine needs no service.
+func NormalizeUpscaleEngine(engine string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(engine)) {
+	case "", "go", "go_lanczos3":
+		return "go_lanczos3", nil
+	case "sharp", "sharp_lanczos3":
+		return "sharp_lanczos3", nil
+	case "pillow", "pillow_lanczos":
+		return "pillow_lanczos", nil
+	case "fsrcnn", "fsrcnn_x2":
+		return "fsrcnn_x2", nil
+	default:
+		return "", fmt.Errorf("unsupported image upscale engine; choose go_lanczos3, sharp_lanczos3, pillow_lanczos or fsrcnn_x2")
+	}
+}
+
 // The optional CPU service preserves the original Sharp/Pillow/FSRCNN engines.
 func Upscale(ctx context.Context, raw []byte, size, engine, processor string) ([]byte, string, error) {
 	if size == "" || size == "auto" {
@@ -34,14 +51,12 @@ func Upscale(ctx context.Context, raw []byte, size, engine, processor string) ([
 	if cfg.Width >= w && cfg.Height >= h {
 		return raw, "", nil
 	}
+	engine, err = NormalizeUpscaleEngine(engine)
+	if err != nil {
+		return nil, "", err
+	}
 	if engine == "go_lanczos3" {
 		return Transform(ctx, raw, size, false)
-	}
-	if engine == "" {
-		engine = "sharp_lanczos3"
-	}
-	if engine != "sharp_lanczos3" && engine != "pillow_lanczos" && engine != "fsrcnn_x2" {
-		return nil, "", fmt.Errorf("unsupported image upscale engine")
 	}
 	u, err := url.Parse(processor)
 	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {

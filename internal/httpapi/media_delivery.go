@@ -24,10 +24,28 @@ func (s *Server) resolveOpenAIImage(ctx context.Context, account accounts.Accoun
 	}
 	if boolValue(cfg["image_upscale_enabled"], false) {
 		image.OutputSize = size
-		image.OutputEngine = firstNonEmpty(stringValue(cfg["image_upscale_engine"]), "sharp_lanczos3")
+		image.OutputEngine = stringValue(cfg["image_upscale_engine"])
 		image.ProcessorURL = os.Getenv("GO_IMAGE_PROCESSOR_URL")
 	}
 	return s.openAIImage.Resolve(ctx, account, image, format, s.cfg.ImageDataDir, publicBase)
+}
+
+// Reject invalid names before persisting settings, rather than after generation.
+func validateUpscaleSettings(updates map[string]any) error {
+	value, exists := updates["image_upscale_engine"]
+	if !exists {
+		return nil
+	}
+	engine, ok := value.(string)
+	if !ok {
+		return fmt.Errorf("image_upscale_engine must be a string")
+	}
+	normalized, err := mediafile.NormalizeUpscaleEngine(engine)
+	if err != nil {
+		return err
+	}
+	updates["image_upscale_engine"] = normalized
+	return nil
 }
 
 func (s *Server) thumbnailPath(source string) string {

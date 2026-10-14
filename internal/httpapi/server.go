@@ -1855,6 +1855,10 @@ func (s *Server) settings(w http.ResponseWriter, r *http.Request) {
 		if !decodeJSON(w, r, &updates) {
 			return
 		}
+		if err := validateUpscaleSettings(updates); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error(), "invalid_image_upscale_engine")
+			return
+		}
 		current, err := s.store.PatchManagedConfig(updates)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error(), "server_error")

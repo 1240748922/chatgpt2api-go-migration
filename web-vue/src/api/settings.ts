@@ -1,4 +1,5 @@
 import apiClient from './client'
+import { normalizeImageUpscaleEngine } from '@/lib/imageUpscale'
 import type { ImageErrorMessages, ProxyRuntimeSettings, Settings, SettingsUpdateResponse } from '@/types/api'
 
 export type RawSettings = Record<string, any>
@@ -259,7 +260,7 @@ export function normalizeSettings(raw: RawSettings | null | undefined): Settings
     image_account_concurrency: numberValue(source.image_account_concurrency, 3, 1),
     image_parallel_generation: boolValue(source.image_parallel_generation, true),
     image_upscale_enabled: boolValue(source.image_upscale_enabled, false),
-    image_upscale_engine: ['sharp', 'pillow', 'fsrcnn'].includes(source.image_upscale_engine) ? source.image_upscale_engine : 'go',
+    image_upscale_engine: normalizeImageUpscaleEngine(source.image_upscale_engine),
     genbox_push: {
       enabled: boolValue(source.genbox_push?.enabled, false),
       base_url: cleanString(source.genbox_push?.base_url),
