@@ -123,7 +123,7 @@ func (s *Server) imageGenerations(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if isOpenAIImageModel(request.Model) {
-		data, err := s.generateOpenAIImageData(r, r.Context(), request.Prompt, request.Model, request.Size, request.Quality, nil, request.ResponseFormat, requestPublicBase(r), request.N)
+		data, err := s.generateOpenAIImageData(r, r.Context(), request.Prompt, request.Model, request.Size, request.Quality, nil, request.ResponseFormat, s.requestPublicBase(r), request.N)
 		if err != nil {
 			s.writeImageError(w, r, err)
 			return
@@ -164,9 +164,10 @@ func (s *Server) imageGenerations(w http.ResponseWriter, r *http.Request) {
 		images = images[:request.N]
 	}
 	data := make([]map[string]string, 0, len(images))
+	publicBase := s.requestPublicBase(r)
 	for _, image := range images {
 		resolveStarted := time.Now()
-		value, resolveErr := s.mediaProvider.ResolveImage(r.Context(), lease.Account, image, request.ResponseFormat, s.cfg.ImageDataDir, requestPublicBase(r))
+		value, resolveErr := s.mediaProvider.ResolveImage(r.Context(), lease.Account, image, request.ResponseFormat, s.cfg.ImageDataDir, publicBase)
 		if resolveErr != nil {
 			s.accountPool.Feedback(lease.Account, upstreamStatus(resolveErr), resolveErr)
 			writeError(w, upstreamStatus(resolveErr), resolveErr.Error(), "upstream_error")
@@ -841,7 +842,7 @@ func (s *Server) imageEdits(w http.ResponseWriter, r *http.Request) {
 			s.writeImageError(w, r, err)
 			return
 		}
-		data, err := s.generateOpenAIImageData(r, r.Context(), prompt, modelName, size, request.Quality, inputs, format, requestPublicBase(r), n)
+		data, err := s.generateOpenAIImageData(r, r.Context(), prompt, modelName, size, request.Quality, inputs, format, s.requestPublicBase(r), n)
 		if err != nil {
 			s.writeImageError(w, r, err)
 			return
@@ -896,8 +897,9 @@ func (s *Server) imageEdits(w http.ResponseWriter, r *http.Request) {
 	}
 	data := make([]map[string]string, 0, minInt(n, len(images)))
 	format := imageEditResponseFormat(request.ResponseFormat)
+	publicBase := s.requestPublicBase(r)
 	for _, image := range images[:minInt(n, len(images))] {
-		value, resolveErr := s.mediaProvider.ResolveImage(r.Context(), lease.Account, image, format, s.cfg.ImageDataDir, requestPublicBase(r))
+		value, resolveErr := s.mediaProvider.ResolveImage(r.Context(), lease.Account, image, format, s.cfg.ImageDataDir, publicBase)
 		if resolveErr != nil {
 			writeError(w, upstreamStatus(resolveErr), resolveErr.Error(), "upstream_error")
 			return
@@ -1095,12 +1097,43 @@ func collectImageEvents(reader io.Reader) []provider.ImageResult {
 	return results
 }
 
-func requestPublicBase(r *http.Request) string {
+// Use the administrator's saved image address without trusting arbitrary Host
+// headers. Deployment environment overrides and persisted task origins keep
+// their existing precedence.
+func (s *Server) requestPublicBase(r *http.Request) string {
+	// Avoid an extra configuration read when deployment settings or a captured
+	// task origin already determine the URL.
 	if value, ok := r.Context().Value(imageTaskPublicBaseKey{}).(string); ok {
 		return value
 	}
 	for _, key := range []string{"GO_PUBLIC_BASE_URL", "CHATGPT2API_BASE_URL"} {
 		if value := normalizePublicBaseURL(os.Getenv(key)); value != "" {
+			return value
+		}
+	}
+	if s.store != nil {
+		if cfg, err := s.store.Config(); err == nil {
+			value, exists := cfg["base_url"]
+			if !exists {
+				value = mapValue(cfg["basic"])["base_url"]
+			}
+			return requestPublicBase(r, stringValue(value))
+		}
+	}
+	return requestPublicBase(r)
+}
+
+func requestPublicBase(r *http.Request, configuredBases ...string) string {
+	if value, ok := r.Context().Value(imageTaskPublicBaseKey{}).(string); ok {
+		return value
+	}
+	for _, key := range []string{"GO_PUBLIC_BASE_URL", "CHATGPT2API_BASE_URL"} {
+		if value := normalizePublicBaseURL(os.Getenv(key)); value != "" {
+			return value
+		}
+	}
+	for _, base := range configuredBases {
+		if value := normalizePublicBaseURL(base); value != "" {
 			return value
 		}
 	}

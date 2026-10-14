@@ -16,7 +16,7 @@
 
       <FormField label="图片访问地址">
         <template #label-extra>
-          <HelpTip text="用于生成图片结果的访问前缀地址。" />
+          <HelpTip text="填写调用方可访问的 http://IP:端口 或 https://域名，不要追加 /v1；用于返回完整图片链接。部署变量 GO_PUBLIC_BASE_URL 或 CHATGPT2API_BASE_URL 优先；全部留空时可能返回站内相对路径。" />
         </template>
         <Input
           v-model.trim="settings.base_url"

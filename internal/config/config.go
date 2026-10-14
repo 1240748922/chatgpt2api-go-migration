@@ -206,7 +206,7 @@ func Load(root string) (Config, error) {
 		RegisterCaptchaURL:     strings.TrimRight(strings.TrimSpace(os.Getenv("GO_REGISTER_CAPTCHA_URL")), "/"),
 		RegisterDriverURL:      strings.TrimRight(strings.TrimSpace(os.Getenv("GO_REGISTER_DRIVER_URL")), "/"),
 		RegisterDriverKey:      strings.TrimSpace(os.Getenv("GO_REGISTER_DRIVER_KEY")),
-		Version:                env("GO_VERSION", "3.3.2-go.local"),
+		Version:                env("GO_VERSION", "3.3.3-go.local"),
 		AllowAnonymous:         envBool("GO_ALLOW_ANONYMOUS", false),
 		RequestTimeout:         time.Duration(requestTimeoutSeconds) * time.Second,
 		ChatMaxRetries:         chatMaxRetries,

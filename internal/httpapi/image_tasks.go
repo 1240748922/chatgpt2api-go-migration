@@ -206,7 +206,7 @@ func (s *Server) createImageTask(w http.ResponseWriter, r *http.Request, task im
 			return
 		}
 	}
-	task.PublicBase = requestPublicBase(r)
+	task.PublicBase = s.requestPublicBase(r)
 	task.Status = "queued"
 	task.CreatedAt = time.Now().UTC().Format(time.RFC3339Nano)
 	task.UpdatedAt = task.CreatedAt

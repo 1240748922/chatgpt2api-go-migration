@@ -162,7 +162,7 @@ func (s *Server) completeOpenAIImageChat(w http.ResponseWriter, r *http.Request,
 		size = "1024x1024"
 	}
 	s.enrichRequestMonitor(r, map[string]any{"size": size, "image_url_parts": len(inputs), "data_url_images": len(inputs)})
-	data, err := s.generateOpenAIImageData(r, r.Context(), prompt, request.Model, size, "auto", inputs, "url", requestPublicBase(r), 1)
+	data, err := s.generateOpenAIImageData(r, r.Context(), prompt, request.Model, size, "auto", inputs, "url", s.requestPublicBase(r), 1)
 	if err != nil {
 		s.writeImageError(w, r, err)
 		return

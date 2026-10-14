@@ -161,7 +161,7 @@ func (s *Server) testSelectedAccount(w http.ResponseWriter, r *http.Request, ref
 				err = errors.New("image test returned no image")
 			}
 			if err == nil {
-				value, url, e := s.resolveOpenAIImage(context.WithValue(flowCtx, imageDeliveryKey{}, deliveryID), lease.Account, images[0], "auto", "url", requestPublicBase(r))
+				value, url, e := s.resolveOpenAIImage(context.WithValue(flowCtx, imageDeliveryKey{}, deliveryID), lease.Account, images[0], "auto", "url", s.requestPublicBase(r))
 				err = e
 				if err == nil {
 					result["content"] = "![image](" + value["url"] + ")"
