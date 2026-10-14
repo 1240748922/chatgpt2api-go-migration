@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
 
 env:
-  IMAGE_NAME: gptgrok2api
+  IMAGE_NAME: chatgpt-images-go
 
 jobs:
   docker:
@@ -51,8 +51,8 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: ./Dockerfile
-          target: app
+          file: ./Dockerfile.golang
+          target: app-runtime
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}

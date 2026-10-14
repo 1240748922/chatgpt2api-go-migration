@@ -6,7 +6,7 @@
 - Go 基线：`gptGrok2api`，提交 `f91732d`。
 - 工作分支：`codex/go-feature-migration`。
 - 本地目录：`D:\SDNT\gptGrok2api-local-migration`。
-- 原 Python 工作目录保留原状。本次没有连接服务器，没有复制真实账号、凭据、生产数据库或生产配置，也没有推送 GitHub。
+- 原 Python 工作目录保留原状。开发和测试没有连接服务器，也没有复制真实账号、凭据、生产数据库或生产配置；仓库仅推送代码与示例配置。
 
 ## 功能迁移
 
